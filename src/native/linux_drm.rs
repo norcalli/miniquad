@@ -866,11 +866,11 @@ where
                                                     std::str::from_utf8_unchecked(&buffer[..len])
                                                 }
                                             }
-                                            crate::debug!(
-                                                "Key: {:4} {:?}",
-                                                shortmods(&mut [0u8; 4], kbd.key_mods),
-                                                (action, keycode)
-                                            );
+                                            // crate::debug!(
+                                            //     "Key: {:4} {:?}",
+                                            //     shortmods(&mut [0u8; 4], kbd.key_mods),
+                                            //     (action, keycode)
+                                            // );
                                             if {
                                                 let m = kbd.key_mods;
                                                 m.alt && m.ctrl && m.shift && m.logo
