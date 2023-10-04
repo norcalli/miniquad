@@ -565,7 +565,7 @@ where
                 let pitch = cursor.buf.pitch as usize;
                 for offset in (0..(cursor.buf.size as usize)).step_by(4) {
                     let (x, y) = ((offset % pitch) / 4, offset / pitch);
-                    if x < 16 && y < 16 && (x + y) < 16 {
+                    if x < 16 && y < 16 && (x / 2 + y) < 16 && x < y {
                     } else {
                         continue;
                     }
@@ -576,7 +576,8 @@ where
                     let border_thickness = 1;
                     if x < border_thickness
                         || y < border_thickness
-                        || (x + y) >= (16 - border_thickness)
+                        || x >= y.saturating_sub(border_thickness)
+                        || (x / 2 + y) >= (16 - border_thickness)
                     {
                         *b = 0;
                         *g = 0;
