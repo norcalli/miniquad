@@ -1121,6 +1121,16 @@ where
                                                 }
                                                 _ => (),
                                             }
+                                        } else if event.type_ == EventType::EV_REL as u16 {
+                                            match event.code {
+                                                x if x == RelAxis::REL_X as u16 => {
+                                                    mouse.x += event.value as f32;
+                                                }
+                                                x if x == RelAxis::REL_Y as u16 => {
+                                                    mouse.y += event.value as f32;
+                                                }
+                                                _ => (),
+                                            }
                                         }
                                     }
                                     let (touch_start_x, touch_stop_x) = touch_x.unwrap_or_default();
@@ -1283,16 +1293,65 @@ unsafe fn read_input_events<'a>(
 const EVIOCGRAB: u64 = 0x40044590;
 const EVIOCGREP: u64 = 0x80084503;
 const EVIOCSREP: u64 = 0x40084503;
-const fn EVIOCGABS(abs: AbsAxis) -> u64 {
+pub const fn EVIOCGABS(abs: AbsAxis) -> u64 {
     0x80184540 + abs as u64
 }
+pub const fn EVIOCGBIT(ty: Option<EventType>, len: u64) -> u64 {
+    let ty = match ty {
+        None => 0,
+        Some(x) => x as u64,
+    };
+    (((2) << (((0 + 8) + 8) + 14))
+        | ((b'E' as u64) << (0 + 8))
+        | ((0x20 + (ty)) << 0)
+        | ((len) << ((0 + 8) + 8)))
+}
+pub const fn EVIOCGPROP(prop: InputProperty) -> u64 {
+    (((2) << (((0 + 8) + 8) + 14))
+        | ((b'E' as u64) << (0 + 8))
+        | ((0x09) << 0)
+        | ((prop as u64) << ((0 + 8) + 8)))
+}
+#[derive(PartialEq, Eq, PartialOrd, Ord, Copy, Clone, Debug)]
 #[repr(u64)]
-enum AbsAxis {
+pub enum InputProperty {
+    /* needs a pointer */
+    INPUT_PROP_POINTER = 0x00,
+    /* direct input devices */
+    INPUT_PROP_DIRECT = 0x01,
+    /* has button(s) under pad */
+    INPUT_PROP_BUTTONPAD = 0x02,
+    /* touch rectangle only */
+    INPUT_PROP_SEMI_MT = 0x03,
+    /* softbuttons at top of pad */
+    INPUT_PROP_TOPBUTTONPAD = 0x04,
+    /* is a pointing stick */
+    INPUT_PROP_POINTING_STICK = 0x05,
+    /* has accelerometer */
+    INPUT_PROP_ACCELEROMETER = 0x06,
+}
+#[derive(PartialEq, Eq, PartialOrd, Ord, Copy, Clone, Debug)]
+#[repr(u64)]
+pub enum AbsAxis {
     ABS_X = 0x00,
     ABS_Y = 0x01,
     ABS_Z = 0x02,
     ABS_MT_POSITION_X = 0x35,
     ABS_MT_POSITION_Y = 0x36,
+}
+#[derive(PartialEq, Eq, PartialOrd, Ord, Copy, Clone, Debug)]
+#[repr(u64)]
+pub enum RelAxis {
+    REL_X = 0x00,
+    REL_Y = 0x01,
+    REL_Z = 0x02,
+    REL_RX = 0x03,
+    REL_RY = 0x04,
+    REL_RZ = 0x05,
+    REL_HWHEEL = 0x06,
+    REL_DIAL = 0x07,
+    REL_WHEEL = 0x08,
+    REL_MISC = 0x09,
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
@@ -1370,36 +1429,56 @@ unsafe fn find_devices() -> (Vec<Keyboard>, Vec<Mouse>) {
         // let mut abs_info = libc::input_absinfo {
         let mut x_abs_info = InputAbsinfo::default();
         let mut y_abs_info = InputAbsinfo::default();
-        if 0 <= libc::ioctl(fd, EVIOCGREP, &mut kbd_repeat) {
-            eprintln!("{} {kbd_repeat:?}", path.display());
-            // Get exclusive access to the keyboard.
-            // https://stackoverflow.com/questions/1698423/how-can-you-take-ownership-of-a-hid-device/1698686#1698686
-            // https://unix.stackexchange.com/questions/77756/can-i-stop-linux-from-listening-to-a-usb-input-device-as-a-keyboard-but-still-c
-            assert!(0 <= libc::ioctl(fd, EVIOCGRAB, 1));
-            keyboards.push(Keyboard {
-                name: name.unwrap_or_default(),
-                path,
-                default_kbd_repeat: kbd_repeat,
-                fd,
-                key_mods: KeyMods::default(),
-            });
-        } else if 0 <= libc::ioctl(fd, EVIOCGABS(AbsAxis::ABS_X), &mut x_abs_info)
-            && 0 <= libc::ioctl(fd, EVIOCGABS(AbsAxis::ABS_Y), &mut y_abs_info)
-        {
-            eprintln!("{} X: {x_abs_info:?}. Y: {y_abs_info:?}", path.display());
-            assert!(0 <= libc::ioctl(fd, EVIOCGRAB, 1));
-            mice.push(Mouse {
-                path,
-                name: name.unwrap_or_default(),
-                fd,
-                x_abs_info,
-                y_abs_info,
-                x: 0.0,
-                y: 0.0,
-            });
-        } else {
-            // NB: Closing an event device is slow.
-            // libc::close(fd);
+        let mut event_types = 0u64;
+        if 0 <= libc::ioctl(
+            fd,
+            EVIOCGBIT(None, std::mem::size_of_val(&event_types) as u64),
+            (&mut event_types) as *mut _,
+        ) {
+            // TODO check properties for how to translate screen size.
+            if ((event_types >> (EventType::EV_REL as u32)) & 1) == 1 {
+                eprintln!("{} X: {x_abs_info:?}. Y: {y_abs_info:?}", path.display());
+                assert!(0 <= libc::ioctl(fd, EVIOCGRAB, 1));
+                mice.push(Mouse {
+                    path,
+                    name: name.unwrap_or_default(),
+                    fd,
+                    x_abs_info,
+                    y_abs_info,
+                    x: 0.0,
+                    y: 0.0,
+                });
+            } else if 0 <= libc::ioctl(fd, EVIOCGREP, &mut kbd_repeat) {
+                eprintln!("{} {kbd_repeat:?}", path.display());
+                // Get exclusive access to the keyboard.
+                // https://stackoverflow.com/questions/1698423/how-can-you-take-ownership-of-a-hid-device/1698686#1698686
+                // https://unix.stackexchange.com/questions/77756/can-i-stop-linux-from-listening-to-a-usb-input-device-as-a-keyboard-but-still-c
+                assert!(0 <= libc::ioctl(fd, EVIOCGRAB, 1));
+                keyboards.push(Keyboard {
+                    name: name.unwrap_or_default(),
+                    path,
+                    default_kbd_repeat: kbd_repeat,
+                    fd,
+                    key_mods: KeyMods::default(),
+                });
+            } else if 0 <= libc::ioctl(fd, EVIOCGABS(AbsAxis::ABS_X), &mut x_abs_info)
+                && 0 <= libc::ioctl(fd, EVIOCGABS(AbsAxis::ABS_Y), &mut y_abs_info)
+            {
+                eprintln!("{} X: {x_abs_info:?}. Y: {y_abs_info:?}", path.display());
+                assert!(0 <= libc::ioctl(fd, EVIOCGRAB, 1));
+                mice.push(Mouse {
+                    path,
+                    name: name.unwrap_or_default(),
+                    fd,
+                    x_abs_info,
+                    y_abs_info,
+                    x: 0.0,
+                    y: 0.0,
+                });
+            } else {
+                // NB: Closing an event device is slow.
+                // libc::close(fd);
+            }
         }
     }
     (keyboards, mice)
