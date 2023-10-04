@@ -1,9 +1,10 @@
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use std::{
     collections::BTreeSet,
     ffi::{CStr, CString},
     path::PathBuf,
     ptr::{copy_nonoverlapping, null, null_mut, NonNull},
+    rc::Rc,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
@@ -186,21 +187,41 @@ pub type drmModeGetConnector =
     unsafe extern "C" fn(fd: i32, connectorId: u32) -> drmModeConnectorPtr;
 pub type drmModeGetEncoder = unsafe extern "C" fn(fd: i32, encoderId: u32) -> drmModeEncoderPtr;
 pub type drmModeGetCrtc = unsafe extern "C" fn(fd: i32, crtcId: u32) -> drmModeCrtcPtr;
-pub type drmHandleEvent = unsafe extern "C" fn(fd: i32, evctx: *const drmEventContext) -> i32;
+pub type drmHandleEvent = unsafe extern "C" fn(fd: i32, evctx: *const drmEventContext) -> DrmResult;
 
 /**
  * Set the mode on a crtc crtcId with the given mode modeId.
  */
 pub type drmModeSetCrtc = unsafe extern "C" fn(
     fd: i32,
-    crtcI: u32,
+    crtcId: u32,
     bufferId: u32,
     x: u32,
     y: u32,
     connectors: *const u32,
     connector_count: i32,
     mode: drmModeModeInfoPtr,
-) -> i32;
+) -> DrmResult;
+
+/**
+ * Set the cursor on crtc
+ */
+pub type drmModeSetCursor =
+    unsafe extern "C" fn(fd: i32, crtcId: u32, bufferId: u32, width: u32, height: u32) -> DrmResult;
+pub type drmModeSetCursor2 = unsafe extern "C" fn(
+    fd: i32,
+    crtcId: u32,
+    bufferId: u32,
+    width: u32,
+    height: u32,
+    hot_x: i32,
+    hot_y: i32,
+) -> DrmResult;
+/**
+ * Move the cursor on crtc
+ */
+pub type drmModeMoveCursor =
+    unsafe extern "C" fn(fd: i32, crtcId: u32, x: i32, x: i32) -> DrmResult;
 
 pub type drmModeFreeModeInfo = unsafe extern "C" fn(drmModeModeInfoPtr);
 pub type drmModeFreeResources = unsafe extern "C" fn(drmModeResPtr);
@@ -224,16 +245,42 @@ pub type drmModeAddFB = unsafe extern "C" fn(
     pitch: u32,
     bo_handle: u32,
     buf_id: *mut u32,
-) -> i32;
-pub type drmModeRmFB = unsafe extern "C" fn(fd: i32, buf_id: u32) -> i32;
+) -> DrmResult;
+pub type drmModeRmFB = unsafe extern "C" fn(fd: i32, buf_id: u32) -> DrmResult;
 pub type drmModePageFlip = unsafe extern "C" fn(
     fd: i32,
     crtc_id: u32,
     fb_id: u32,
     flags: u32,
     user_data: *mut c_void,
-) -> i32;
-pub type drmSetMaster = unsafe extern "C" fn(fd: i32) -> i32;
+) -> DrmResult;
+pub type drmSetMaster = unsafe extern "C" fn(fd: i32) -> DrmResult;
+pub type drmDropMaster = unsafe extern "C" fn(fd: i32) -> DrmResult;
+
+/**
+ * Create a dumb buffer.
+ *
+ * Given a width, height and bits-per-pixel, the kernel will return a buffer
+ * handle, pitch and size. The flags must be zero.
+ *
+ * Returns 0 on success, negative errno on error.
+ */
+pub type drmModeCreateDumbBuffer = unsafe extern "C" fn(
+    fd: i32,
+    width: u32,
+    height: u32,
+    bpp: u32,
+    // must be 0
+    flags: u32,
+    handle: *mut u32,
+    pitch: *mut u32,
+    size: *mut u64,
+) -> DrmResult;
+
+pub type drmModeDestroyDumbBuffer = unsafe extern "C" fn(fd: i32, handle: u32) -> DrmResult;
+
+pub type drmModeMapDumbBuffer =
+    unsafe extern "C" fn(fd: i32, handle: u32, offset: *mut u64) -> DrmResult;
 
 #[derive(Clone)]
 pub struct LibDrm {
@@ -253,6 +300,13 @@ pub struct LibDrm {
     pub drmHandleEvent: drmHandleEvent,
     pub drmModePageFlip: drmModePageFlip,
     pub drmSetMaster: drmSetMaster,
+    pub drmDropMaster: drmDropMaster,
+    pub drmModeSetCursor: drmModeSetCursor,
+    pub drmModeSetCursor2: drmModeSetCursor2,
+    pub drmModeMoveCursor: drmModeMoveCursor,
+    pub drmModeCreateDumbBuffer: drmModeCreateDumbBuffer,
+    pub drmModeDestroyDumbBuffer: drmModeDestroyDumbBuffer,
+    pub drmModeMapDumbBuffer: drmModeMapDumbBuffer,
 }
 
 impl LibDrm {
@@ -275,6 +329,13 @@ impl LibDrm {
                 drmHandleEvent: module.get_symbol("drmHandleEvent").unwrap(),
                 drmModePageFlip: module.get_symbol("drmModePageFlip").unwrap(),
                 drmSetMaster: module.get_symbol("drmSetMaster").unwrap(),
+                drmDropMaster: module.get_symbol("drmDropMaster").unwrap(),
+                drmModeSetCursor: module.get_symbol("drmModeSetCursor").unwrap(),
+                drmModeSetCursor2: module.get_symbol("drmModeSetCursor2").unwrap(),
+                drmModeMoveCursor: module.get_symbol("drmModeMoveCursor").unwrap(),
+                drmModeCreateDumbBuffer: module.get_symbol("drmModeCreateDumbBuffer").unwrap(),
+                drmModeDestroyDumbBuffer: module.get_symbol("drmModeDestroyDumbBuffer").unwrap(),
+                drmModeMapDumbBuffer: module.get_symbol("drmModeMapDumbBuffer").unwrap(),
                 module: std::rc::Rc::new(module),
             })
             .ok()
@@ -360,23 +421,75 @@ unsafe fn errno() -> i32 {
     *libc::__errno_location()
 }
 
+#[derive(Debug)]
+pub struct drmDumbBuffer {
+    fd: i32,
+    handle: u32,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    size: u64,
+    offset: u64,
+    buffer_id: u32,
+}
+
+pub struct DumbBuffer {
+    map: memmap2::MmapMut,
+    buf: drmDumbBufferGc,
+}
+
+impl DumbBuffer {
+    pub unsafe fn try_new(libdrm: &Rc<LibDrm>, fd: i32, width: u32, height: u32) -> Result<Self> {
+        let mut buf = libdrm.drmModeCreateDumbBuffer(fd, width, height)?;
+        (libdrm.drmModeAddFB)(
+            fd,
+            buf.width,
+            buf.height,
+            24,
+            32,
+            buf.pitch,
+            buf.handle,
+            // TODO
+            &mut (*(buf.value as *mut drmDumbBuffer)).buffer_id,
+        )
+        .anyhow("drmModeAddFB dumb buffer")?;
+        (libdrm.drmModeMapDumbBuffer)(
+            fd,
+            buf.handle,
+            // TODO
+            &mut (*(buf.value as *mut drmDumbBuffer)).offset,
+        )
+        .anyhow("drmModeMapDumbBuffer")?;
+        let map = memmap2::MmapOptions::new()
+            .offset(buf.offset)
+            .len(buf.size as usize)
+            .map_mut(buf.fd)?;
+        Ok(Self { map, buf })
+    }
+}
+
 pub fn run<F>(conf: &crate::conf::Conf, f: &mut Option<F>) -> Option<()>
 where
     F: 'static + FnOnce() -> Box<dyn EventHandler>,
 {
-    run2(conf, f).ok()
+    run2(conf, f)
+        .map_err(|err| {
+            eprintln!("Failed to initialize DRM backend: {err:?}");
+        })
+        .ok()
 }
 
+// https://manpages.debian.org/stretch-backports/libdrm-dev/drm-kms.7.en.html#Mode-Setting
 pub fn run2<F>(conf: &crate::conf::Conf, f: &mut Option<F>) -> anyhow::Result<()>
 where
     F: 'static + FnOnce() -> Box<dyn EventHandler>,
 {
     unsafe {
         let libdrm = LibDrm::try_load().ok_or_else(|| anyhow!("Failed to load libdrm"))?;
+        let libdrm = Rc::new(libdrm);
 
         let (resources, drm_fd, path) = find_device_resource(&libdrm);
-        // TODO use this?
-        ensure!(0 == (libdrm.drmSetMaster)(drm_fd));
+        (libdrm.drmSetMaster)(drm_fd).anyhow("drmSetMaster")?;
 
         dbg!(&resources);
         dbg!(resources.connector_ids());
@@ -411,7 +524,7 @@ where
             }
         }
         let crtc = &crtcs[0].1[0];
-        let status = (libdrm.drmModeSetCrtc)(
+        (libdrm.drmModeSetCrtc)(
             drm_fd,
             crtc.crtc_id,
             // TODO buffer_id?
@@ -424,29 +537,72 @@ where
             &connector.connector_id,
             1,
             &crtc.mode,
-        );
-        if status != 0 {
-            if status == -libc::EINVAL {
-                panic!("Crtc ID is invalid");
-            } else if status == -1 {
-                panic!(
-                    "If count is invalid, or the list specified by connectors \
-                is incompatible with the CRTC."
-                );
-            } else {
-                let message = strerror(status);
-                let message = message.to_str().unwrap_or_default();
-                panic!(
-                    "{}",
-                    format!(
-                        "Mode set failed for {crtc:?}.\n\
-                    Status code: {status}. Message {message:?}"
-                    )
-                );
-            }
-            std::process::exit(1);
-        }
+        )
+        .anyhow("Mode set failed")
+        .with_context(|| format!("Crtc: {crtc:?}"))?;
+        // if let Err(errno) = status.ok_or_errno() {
+        //     if errno == libc::EINVAL {
+        //         panic!("Crtc ID is invalid");
+        //     } else if errno == 1 {
+        //         panic!(
+        //             "If count is invalid, or the list specified by connectors \
+        //         is incompatible with the CRTC."
+        //         );
+        //     } else {
+        //     }
+        // }
         eprintln!("Successfully set crtc to {crtc:?}");
+
+        // BGR(A)
+        let mut cursor = None;
+        // std::process::exit(1);
+        // TODO stride/pitch
+        for dim in [128, 64, 32] {
+            cursor = (|| -> anyhow::Result<DumbBuffer> {
+                let mut cursor = DumbBuffer::try_new(&libdrm, drm_fd, dim, dim)?;
+                dbg!(&cursor.buf);
+                let map = &mut cursor.map;
+                let pitch = cursor.buf.pitch as usize;
+                for offset in (0..(cursor.buf.size as usize)).step_by(4) {
+                    let (x, y) = ((offset % pitch) / 4, offset / pitch);
+                    if x < 16 && y < 16 && (x + y) < 16 {
+                    } else {
+                        continue;
+                    }
+                    let [b, g, r, a] = &mut map[offset..][..4] else {
+                        continue;
+                    };
+                    *a = 0xff;
+                    let border_thickness = 1;
+                    if x < border_thickness
+                        || y < border_thickness
+                        || (x + y) >= (16 - border_thickness)
+                    {
+                        *b = 0;
+                        *g = 0;
+                        *r = 0;
+                    } else {
+                        *b = 0xef;
+                        *g = 0xef;
+                        *r = 0xef;
+                    }
+                }
+                (libdrm.drmModeSetCursor)(
+                    drm_fd,
+                    crtc.crtc_id,
+                    cursor.buf.handle,
+                    cursor.buf.width,
+                    cursor.buf.height,
+                )
+                .anyhow("drmModeSetCursor")?;
+                Ok(cursor)
+            })()
+            .map_err(|err| eprintln!("Failed to make {dim}x{dim} cursor: {err:?}"))
+            .ok();
+            if cursor.is_some() {
+                break;
+            }
+        }
 
         let libegl = egl::LibEgl::try_load().ok_or_else(|| anyhow!("Failed to load libegl"))?;
         let qs = (libegl.eglQueryString.unwrap())(egl::EGL_NO_DISPLAY, egl::EGL_EXTENSIONS as i32);
@@ -629,21 +785,22 @@ where
                 let fd: u32 = (libgbm.gbm_bo_get_handle)(bo).u32;
                 let mut fb = 0;
                 // int ok = drmModeAddFB(Drm->Fd, width, height, 24, 32, stride, fd, &Fb);
-                assert!(
-                    0 == (libdrm.drmModeAddFB)(drm_fd, width, height, 24, 32, stride, fd, &mut fb)
-                );
-                assert!(
-                    0 == (libdrm.drmModeSetCrtc)(
-                        drm_fd,
-                        crtc.crtc_id,
-                        fb,
-                        0,
-                        0,
-                        &connector.connector_id,
-                        1,
-                        &crtc.mode
-                    )
-                );
+                // TODO return result?
+                (libdrm.drmModeAddFB)(drm_fd, width, height, 24, 32, stride, fd, &mut fb)
+                    .anyhow("drmModeAddFB")
+                    .unwrap();
+                (libdrm.drmModeSetCrtc)(
+                    drm_fd,
+                    crtc.crtc_id,
+                    fb,
+                    0,
+                    0,
+                    &connector.connector_id,
+                    1,
+                    &crtc.mode,
+                )
+                .anyhow("drmModeSetCrtc")
+                .unwrap();
                 unsafe extern "C" fn cleanup_fb_handler(_bo: *mut gbm_bo, user: *mut c_void) {
                     let user: Box<BoUser> = Box::from_raw(user as *mut _);
                     (user.drmModeRmFb)(user.drm_fd, user.fb);
@@ -669,13 +826,17 @@ where
              * page-flip is done.
              */
             pub const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x1;
-            if 0 == (libdrm.drmModePageFlip)(
+            if (libdrm.drmModePageFlip)(
                 drm_fd,
                 crtc.crtc_id,
                 fb,
                 DRM_MODE_PAGE_FLIP_EVENT,
                 null_mut(),
-            ) {
+            )
+            .ok_or_errno()
+            // TODO throw error?
+            .is_ok()
+            {
                 WAITING_FOR_PAGE_FLIP.store(true, Ordering::SeqCst);
             }
         };
@@ -968,6 +1129,17 @@ where
                                     mouse.x = mouse.x.clamp(0.0, w as f32);
                                     mouse.y = mouse.y.clamp(0.0, h as f32);
                                     if old_pos != (mouse.x, mouse.y) {
+                                        if cursor.is_some() {
+                                            (libdrm.drmModeMoveCursor)(
+                                                drm_fd,
+                                                crtc.crtc_id,
+                                                mouse.x as i32,
+                                                mouse.y as i32,
+                                            )
+                                            .anyhow("drmModeMoveCursor")
+                                            // TODO
+                                            .map_err(|err| eprintln!("Failed to move cursor"));
+                                        }
                                         // event_handler.mouse_motion_event(mouse.x, mouse.y);
                                         event_handler.mouse_motion_event(
                                             mouse.x,
@@ -1032,22 +1204,35 @@ where
 
         // Cleanup
         {
+            dbg!(cursor.as_ref().map(|x| &x.buf));
+            drop(cursor);
             (libegl.eglMakeCurrent.unwrap())(egl_display, null_mut(), null_mut(), null_mut());
             (libegl.eglDestroyContext.unwrap())(egl_display, egl_context);
             (libegl.eglDestroySurface.unwrap())(egl_display, egl_surface);
             (libegl.eglTerminate.unwrap())(egl_display);
-            assert!(
-                0 == (libdrm.drmModeSetCrtc)(
-                    drm_fd,
-                    crtc.crtc_id,
-                    crtc.buffer_id,
-                    crtc.x,
-                    crtc.y,
-                    &connector.connector_id,
-                    1,
-                    &crtc.mode
-                )
-            );
+
+            (libdrm.drmModeSetCursor)(drm_fd, crtc.crtc_id, 0, 0, 0)
+                .anyhow("drmModeSetCursor")
+                // TODO panic or log?
+                .map_err(|err| eprintln!("{err:?}"));
+
+            (libdrm.drmModeSetCrtc)(
+                drm_fd,
+                crtc.crtc_id,
+                crtc.buffer_id,
+                crtc.x,
+                crtc.y,
+                &connector.connector_id,
+                1,
+                &crtc.mode,
+            )
+            .anyhow("drmModeSetCrtc cleanup")
+            // TODO panic or log?
+            .map_err(|err| eprintln!("{err:?}"));
+            (libdrm.drmDropMaster)(drm_fd)
+                .anyhow("drmDropMaster")
+                .map_err(|err| eprintln!("{err:?}"));
+
             if let Some(last_bo) = last_bo.take() {
                 // let dri = (libgbm.gbm_device_get_fd)((libgbm.gbm_bo_get_device)(bo));
                 (libgbm.gbm_surface_release_buffer)(surface, last_bo);
@@ -1055,6 +1240,7 @@ where
             }
             (libgbm.gbm_surface_destroy)(surface);
             (libgbm.gbm_device_destroy)(device);
+            // TODO delay closing this until everything else has been closed.
             libc::close(drm_fd);
         }
         Ok(())
@@ -1311,8 +1497,8 @@ impl drmModeEncoder {
 #[derive(Clone)]
 pub struct LibDrmPointer<T> {
     value: *const T,
-    free_fn: unsafe extern "C" fn(*const T),
-    module: std::rc::Rc<module::Module>,
+    free_fn: unsafe fn(*const T, &LibDrm),
+    drm: Rc<LibDrm>,
     gc: std::rc::Rc<()>,
 }
 
@@ -1326,7 +1512,7 @@ impl<T: std::fmt::Debug> std::fmt::Debug for LibDrmPointer<T> {
 impl<T> Drop for LibDrmPointer<T> {
     fn drop(&mut self) {
         if std::rc::Rc::strong_count(&self.gc) == 1 {
-            unsafe { (self.free_fn)(self.value) };
+            unsafe { (self.free_fn)(self.value, &self.drm) };
         }
     }
 }
@@ -1343,66 +1529,157 @@ pub type drmModeResGc = LibDrmPointer<drmModeRes>;
 pub type drmModeCrtcGc = LibDrmPointer<drmModeCrtc>;
 pub type drmModeEncoderGc = LibDrmPointer<drmModeEncoder>;
 pub type drmModeConnectorGc = LibDrmPointer<drmModeConnector>;
+pub type drmDumbBufferGc = LibDrmPointer<drmDumbBuffer>;
+
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct DrmResult(i32);
+
+impl DrmResult {
+    #[must_use]
+    pub fn anyhow(self, name: impl std::fmt::Display) -> anyhow::Result<()> {
+        self.ok_or_errno().map_err(|errno| {
+            anyhow::anyhow!(
+                "DRM {name} failed ({errno}{}): {}",
+                match errno {
+                    libc::EINVAL => " EINVAL",
+                    _ => "",
+                },
+                strerror(errno).to_string_lossy()
+            )
+        })
+        // if self.0 == 0 {
+        //     Ok(())
+        // } else {
+        //     let errno = -self.0;
+        //     Err(anyhow::anyhow!("DRM {name} failed ({errno}): {}", strerror(-errno).to_string_lossy()))
+        // }
+    }
+
+    pub fn ok_or_errno(self) -> Result<(), i32> {
+        if self.0 == 0 {
+            Ok(())
+        } else {
+            Err(-self.0)
+        }
+    }
+}
 
 impl LibDrm {
-    pub fn drmModeGetEncoder(&self, fd: i32, id: u32) -> Option<drmModeEncoderGc> {
+    pub fn drmModeGetEncoder(self: &Rc<Self>, fd: i32, id: u32) -> Option<drmModeEncoderGc> {
         let encoder = unsafe { (self.drmModeGetEncoder)(fd, id) };
         if encoder.is_null() {
             None
         } else {
             Some(LibDrmPointer {
                 value: encoder,
-                free_fn: self.drmModeFreeEncoder,
-                module: self.module.clone(),
-                gc: std::rc::Rc::new(()),
+                free_fn: |value, drm| unsafe { (drm.drmModeFreeEncoder)(value) },
+                drm: self.clone(),
+                gc: Rc::new(()),
             })
         }
     }
-    pub fn drmModeGetCrtc(&self, fd: i32, id: u32) -> Option<drmModeCrtcGc> {
+
+    pub fn drmModeCreateDumbBuffer(
+        self: &Rc<Self>,
+        fd: i32,
+        width: u32,
+        height: u32,
+    ) -> Result<drmDumbBufferGc> {
+        let mut handle = 0u32;
+        let mut pitch = 0u32;
+        let mut size = 0u64;
+        unsafe {
+            (self.drmModeCreateDumbBuffer)(
+                fd,
+                width,
+                height,
+                32,
+                0,
+                &mut handle,
+                &mut pitch,
+                &mut size,
+            )
+        }
+        .anyhow("drmModeCreateDumbBuffer")?;
+        let value = Box::into_raw(Box::new(drmDumbBuffer {
+            fd,
+            handle,
+            width,
+            height,
+            pitch,
+            size,
+            offset: 0u64,
+            buffer_id: 0u32,
+        }));
+        Ok(LibDrmPointer {
+            value,
+            free_fn: |dumb: *const drmDumbBuffer, drm| unsafe {
+                let dumb = Box::from_raw(dumb as *mut drmDumbBuffer);
+                if dumb.buffer_id != 0 {
+                    // TODO flag global error so we get cleanup on DRM
+                    if let Err(err) =
+                        (drm.drmModeRmFB)(dumb.fd, dumb.buffer_id).anyhow("drmModeRmFB dumb buffer")
+                    {
+                        eprintln!("{err:?}");
+                    }
+                }
+                if let Err(err) = (drm.drmModeDestroyDumbBuffer)(dumb.fd, dumb.handle)
+                    .anyhow("drmModeDestroyDumbBuffer")
+                {
+                    eprintln!("{err:?}");
+                }
+            },
+            drm: self.clone(),
+            gc: Rc::new(()),
+        })
+    }
+
+    pub fn drmModeGetCrtc(self: &Rc<Self>, fd: i32, id: u32) -> Option<drmModeCrtcGc> {
         let encoder = unsafe { (self.drmModeGetCrtc)(fd, id) };
         if encoder.is_null() {
             None
         } else {
             Some(LibDrmPointer {
                 value: encoder,
-                free_fn: self.drmModeFreeCrtc,
-                module: self.module.clone(),
-                gc: std::rc::Rc::new(()),
+                free_fn: |value, drm| unsafe { (drm.drmModeFreeCrtc)(value) },
+                drm: self.clone(),
+                gc: Rc::new(()),
             })
         }
     }
 
-    pub fn drmModeGetConnector(&self, fd: i32, id: u32) -> Option<drmModeConnectorGc> {
+    pub fn drmModeGetConnector(self: &Rc<Self>, fd: i32, id: u32) -> Option<drmModeConnectorGc> {
         let encoder = unsafe { (self.drmModeGetConnector)(fd, id) };
         if encoder.is_null() {
             None
         } else {
             Some(LibDrmPointer {
                 value: encoder,
-                free_fn: self.drmModeFreeConnector,
-                module: self.module.clone(),
-                gc: std::rc::Rc::new(()),
+                free_fn: |value, drm| unsafe { (drm.drmModeFreeConnector)(value) },
+                drm: self.clone(),
+                gc: Rc::new(()),
             })
         }
     }
 
-    pub fn drmModeGetResources(&self, fd: i32) -> Option<drmModeResGc> {
+    pub fn drmModeGetResources(self: &Rc<Self>, fd: i32) -> Option<drmModeResGc> {
         let encoder = unsafe { (self.drmModeGetResources)(fd) };
         if encoder.is_null() {
             None
         } else {
             Some(LibDrmPointer {
                 value: encoder,
-                free_fn: self.drmModeFreeResources,
-                module: self.module.clone(),
-                gc: std::rc::Rc::new(()),
+                free_fn: |value, drm| unsafe { (drm.drmModeFreeResources)(value) },
+                drm: self.clone(),
+                gc: Rc::new(()),
             })
         }
     }
 }
 
 unsafe fn find_encoder_for_connector(
-    libdrm: &LibDrm,
+    libdrm: &Rc<LibDrm>,
     resources: &drmModeResGc,
     fd: i32,
     connector: &drmModeConnectorGc,
@@ -1419,7 +1696,7 @@ unsafe fn find_encoder_for_connector(
 }
 
 unsafe fn find_crtcs_for_connector(
-    libdrm: &LibDrm,
+    libdrm: &Rc<LibDrm>,
     resources: &drmModeResGc,
     fd: i32,
     connector: &drmModeConnectorGc,
@@ -1442,7 +1719,7 @@ unsafe fn find_crtcs_for_connector(
 }
 
 unsafe fn find_connected_connector(
-    libdrm: &LibDrm,
+    libdrm: &Rc<LibDrm>,
     resources: &drmModeResGc,
     fd: i32,
 ) -> Option<drmModeConnectorGc> {
@@ -1471,7 +1748,7 @@ unsafe fn find_connected_connector(
     None
 }
 
-fn find_device_resource(libdrm: &LibDrm) -> (drmModeResGc, i32, String) {
+fn find_device_resource(libdrm: &Rc<LibDrm>) -> (drmModeResGc, i32, String) {
     for device_id in 0..32 {
         let path = format!("/dev/dri/card{device_id}");
         let path = CString::new(path).unwrap();
