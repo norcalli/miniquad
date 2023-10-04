@@ -1,3 +1,4 @@
+use anyhow::{anyhow, ensure, Result};
 use std::{
     collections::BTreeSet,
     ffi::{CStr, CString},
@@ -15,6 +16,8 @@ use crate::{
 };
 
 use super::module;
+
+use keyboard_layouts::{available_layouts, string_to_keys_and_modifiers};
 
 #[derive(Debug)]
 #[repr(C)]
@@ -361,17 +364,24 @@ pub fn run<F>(conf: &crate::conf::Conf, f: &mut Option<F>) -> Option<()>
 where
     F: 'static + FnOnce() -> Box<dyn EventHandler>,
 {
+    run2(conf, f).ok()
+}
+
+pub fn run2<F>(conf: &crate::conf::Conf, f: &mut Option<F>) -> anyhow::Result<()>
+where
+    F: 'static + FnOnce() -> Box<dyn EventHandler>,
+{
     unsafe {
-        let libdrm = LibDrm::try_load().expect("Failed to load libdrm");
+        let libdrm = LibDrm::try_load().ok_or_else(|| anyhow!("Failed to load libdrm"))?;
 
         let (resources, drm_fd, path) = find_device_resource(&libdrm);
         // TODO use this?
-        assert!(0 == (libdrm.drmSetMaster)(drm_fd));
+        ensure!(0 == (libdrm.drmSetMaster)(drm_fd));
 
         dbg!(&resources);
         dbg!(resources.connector_ids());
-        let connector =
-            find_connected_connector(&libdrm, &resources, drm_fd).expect("No connector found");
+        let connector = find_connected_connector(&libdrm, &resources, drm_fd)
+            .ok_or_else(|| anyhow!("No connector found"))?;
         for mode in connector.modes() {
             eprintln!(
                 "mode: {}, {}x{}@{}",
@@ -383,7 +393,7 @@ where
         }
         // let mode = &connector.modes()[0];
         let encoder = find_encoder_for_connector(&libdrm, &resources, drm_fd, &connector)
-            .expect("Failed to find encoder for connector");
+            .ok_or_else(|| anyhow!("Failed to find encoder for connector"))?;
         dbg!(encoder);
         let crtcs = find_crtcs_for_connector(&libdrm, &resources, drm_fd, &connector);
         for (encoder, crtcs) in crtcs.iter() {
@@ -438,21 +448,21 @@ where
         }
         eprintln!("Successfully set crtc to {crtc:?}");
 
-        let libegl = egl::LibEgl::try_load().expect("Failed to load libegl");
+        let libegl = egl::LibEgl::try_load().ok_or_else(|| anyhow!("Failed to load libegl"))?;
         let qs = (libegl.eglQueryString.unwrap())(egl::EGL_NO_DISPLAY, egl::EGL_EXTENSIONS as i32);
         let qs = CStr::from_ptr(qs).to_str().unwrap();
         let extensions: BTreeSet<&str> = qs.split_whitespace().collect();
         eprintln!("egl client extensions: {extensions:?}");
-        assert!(extensions.contains("EGL_EXT_platform_base"));
-        assert!(libegl.eglGetProcAddress.is_some());
-        let libgbm = LibGbm::try_load().expect("Failed to load libgbm");
+        ensure!(extensions.contains("EGL_EXT_platform_base"));
+        ensure!(libegl.eglGetProcAddress.is_some());
+        let libgbm = LibGbm::try_load().ok_or_else(|| anyhow!("Failed to load libgbm"))?;
         let device = (libgbm.gbm_create_device)(drm_fd);
-        assert!(!device.is_null(), "Failed to create gbm device");
+        ensure!(!device.is_null(), "Failed to create gbm device");
         const GBM_FORMAT_XRGB8888: u32 = 0x34325258;
         let surface_format: u32 = GBM_FORMAT_XRGB8888;
         let surface_flags: u32 =
             gbm_bo_flags::GBM_BO_USE_SCANOUT as u32 | gbm_bo_flags::GBM_BO_USE_RENDERING as u32;
-        assert!(
+        ensure!(
             (libgbm.gbm_device_is_format_supported)(device, surface_format, surface_flags) == 1
         );
         let surface = (libgbm.gbm_surface_create)(
@@ -462,16 +472,16 @@ where
             surface_format,
             surface_flags,
         );
-        assert!(!surface.is_null(), "Failed to create gbm surface");
+        ensure!(!surface.is_null(), "Failed to create gbm surface");
         let display = (libegl.eglGetPlatformDisplayEXT.unwrap())(
             egl::EGL_PLATFORM_GBM_MESA as i32,
             device as *const c_void,
             std::ptr::null(),
         );
-        assert!(!display.is_null(), "Failed to create egl display");
+        ensure!(!display.is_null(), "Failed to create egl display");
         let mut major = 0i32;
         let mut minor = 0i32;
-        assert!((libegl.eglInitialize.unwrap())(display, &mut major, &mut minor) == 1);
+        ensure!((libegl.eglInitialize.unwrap())(display, &mut major, &mut minor) == 1);
         eprintln!("Initialized egl {major}.{minor}");
         let eglQueryString = |code: u32| {
             let result = (libegl.eglQueryString.unwrap())(display, code as i32);
@@ -674,6 +684,28 @@ where
         let mut start = Instant::now();
         let (mut keyboards, mut mice) = find_devices();
         dbg!(&keyboards, &mice);
+        // crate::native_display().try_lock().unwrap().quit_ordered = true;
+        // dbg!(available_layouts());
+        // let mut lookup = std::collections::HashMap::new();
+        // for c in 0..char::MAX as u32 {
+        //     let Some(c) = char::from_u32(c) else { continue };
+        //     let mut buf = [0u8; 4];
+        //     let Ok(keys) =
+        //         string_to_keys_and_modifiers("LAYOUT_US_ENGLISH", c.encode_utf8(&mut buf)) else {
+        //         continue;
+        //     };
+        //     if c == 'A' {
+        //         println!("{:?}", (c, &keys));
+        //     }
+        //     if c == 'a' {
+        //         println!("{:?}", (c, &keys));
+        //     }
+        //     if keys.len() == 1 {
+        //         // lookup.insert(c, keys[0]);
+        //     } else if keys.len() > 1 {
+        //         // dbg!((c, keys));
+        //     }
+        // }
         let mut poll = vec![];
         for kbd in &keyboards {
             poll.push(libc::pollfd {
@@ -689,7 +721,7 @@ where
                 revents: 0,
             });
         }
-        while !crate::native_display().try_lock().unwrap().quit_ordered {
+        'main: while !crate::native_display().try_lock().unwrap().quit_ordered {
             if keyboards.is_empty() && start.elapsed().as_secs() > 1 {
                 break;
             }
@@ -721,7 +753,7 @@ where
                 for poll in poll.iter_mut() {
                     poll.revents = 0;
                 }
-                let timeout = Duration::from_millis(1);
+                let timeout = Duration::from_millis(3);
                 // TODO what unit is timeout?
                 let count = libc::poll(
                     poll.as_mut_ptr(),
@@ -752,38 +784,100 @@ where
                                 Ok(events) => {
                                     for event in events.iter() {
                                         if let Some((keycode, action)) = key_from_event(event) {
-                                            match keycode {
-                                                KeyCode::KEY_LEFTCTRL | KeyCode::KEY_RIGHTCTRL => {
-                                                    kbd.key_mods.ctrl = action == KeyAction::Up;
+                                            if action != KeyAction::Repeat {
+                                                match keycode {
+                                                    KeyCode::KEY_LEFTCTRL
+                                                    | KeyCode::KEY_RIGHTCTRL => {
+                                                        kbd.key_mods.ctrl = action != KeyAction::Up;
+                                                    }
+                                                    KeyCode::KEY_LEFTALT
+                                                    | KeyCode::KEY_RIGHTALT => {
+                                                        kbd.key_mods.alt = action != KeyAction::Up;
+                                                    }
+                                                    KeyCode::KEY_LEFTSHIFT
+                                                    | KeyCode::KEY_RIGHTSHIFT => {
+                                                        kbd.key_mods.shift =
+                                                            action != KeyAction::Up;
+                                                    }
+                                                    KeyCode::KEY_LEFTMETA
+                                                    | KeyCode::KEY_RIGHTMETA => {
+                                                        kbd.key_mods.logo = action != KeyAction::Up;
+                                                    }
+                                                    // key if key >= KeyCode::KEY_A
+                                                    //     && key <= KeyCode::KEY_Z
+                                                    //     && action != KeyAction::Up =>
+                                                    // {
+                                                    //     let offset = keycode as u8
+                                                    //         - KeyCode::KEY_A as u8
+                                                    //         + if kbd.key_mods.shift {
+                                                    //             b'A'
+                                                    //         } else {
+                                                    //             b'a'
+                                                    //         };
+                                                    //     event_handler.char_event(
+                                                    //         offset as char,
+                                                    //         kbd.key_mods,
+                                                    //         action == KeyAction::Repeat,
+                                                    //     );
+                                                    // }
+                                                    _ => (),
                                                 }
-                                                KeyCode::KEY_LEFTALT | KeyCode::KEY_RIGHTALT => {
-                                                    kbd.key_mods.alt = action == KeyAction::Up;
+                                            }
+                                            if action == KeyAction::Repeat
+                                                || action == KeyAction::Down
+                                            {
+                                                if let Some((c, shift_c)) =
+                                                    chars_from_keycode(keycode)
+                                                {
+                                                    let c = if kbd.key_mods.shift {
+                                                        shift_c
+                                                    } else {
+                                                        c
+                                                    };
+                                                    event_handler.char_event(
+                                                        c,
+                                                        kbd.key_mods,
+                                                        action == KeyAction::Repeat,
+                                                    );
                                                 }
-                                                KeyCode::KEY_LEFTSHIFT
-                                                | KeyCode::KEY_RIGHTSHIFT => {
-                                                    kbd.key_mods.shift = action == KeyAction::Up;
+                                            }
+                                            fn shortmods(
+                                                buffer: &mut [u8; 4],
+                                                mods: KeyMods,
+                                            ) -> &str {
+                                                let mut len = 0;
+                                                if mods.alt {
+                                                    buffer[len] = b'A';
+                                                    len += 1;
                                                 }
-                                                KeyCode::KEY_LEFTMETA | KeyCode::KEY_RIGHTMETA => {
-                                                    kbd.key_mods.logo = action == KeyAction::Up;
+                                                if mods.shift {
+                                                    buffer[len] = b'S';
+                                                    len += 1;
                                                 }
-                                                // key if key >= KeyCode::KEY_A
-                                                //     && key <= KeyCode::KEY_Z
-                                                //     && action != KeyAction::Up =>
-                                                // {
-                                                //     let offset = keycode as u8
-                                                //         - KeyCode::KEY_A as u8
-                                                //         + if kbd.key_mods.shift {
-                                                //             b'A'
-                                                //         } else {
-                                                //             b'a'
-                                                //         };
-                                                //     event_handler.char_event(
-                                                //         offset as char,
-                                                //         kbd.key_mods,
-                                                //         action == KeyAction::Repeat,
-                                                //     );
-                                                // }
-                                                _ => (),
+                                                if mods.ctrl {
+                                                    buffer[len] = b'C';
+                                                    len += 1;
+                                                }
+                                                if mods.logo {
+                                                    buffer[len] = b'M';
+                                                    len += 1;
+                                                }
+                                                unsafe {
+                                                    std::str::from_utf8_unchecked(&buffer[..len])
+                                                }
+                                            }
+                                            crate::debug!(
+                                                "Key: {:4} {:?}",
+                                                shortmods(&mut [0u8; 4], kbd.key_mods),
+                                                (action, keycode)
+                                            );
+                                            if {
+                                                let m = kbd.key_mods;
+                                                m.alt && m.ctrl && m.shift && m.logo
+                                            } && action == KeyAction::Down
+                                                && keycode == KeyCode::KEY_ESC
+                                            {
+                                                break 'main;
                                             }
                                             if let Some(keycode) = keycode.to_macroquad_keycode() {
                                                 match action {
@@ -963,7 +1057,7 @@ where
             (libgbm.gbm_device_destroy)(device);
             libc::close(drm_fd);
         }
-        Some(())
+        Ok(())
     }
 }
 
@@ -1014,7 +1108,7 @@ enum AbsAxis {
     ABS_MT_POSITION_Y = 0x36,
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
 #[repr(u16)]
 pub enum KeyAction {
     Up,
@@ -2301,4 +2395,73 @@ pub enum MouseButton {
     // BTN_WHEEL = 0x150,
     BTN_GEAR_DOWN = 0x150,
     BTN_GEAR_UP = 0x151,
+}
+
+pub fn chars_from_keycode(keycode: KeyCode) -> Option<(char, char)> {
+    Some(match keycode {
+        KeyCode::KEY_1 => ('1', '!'),
+        KeyCode::KEY_2 => ('2', '@'),
+        KeyCode::KEY_3 => ('3', '#'),
+        KeyCode::KEY_4 => ('4', '$'),
+        KeyCode::KEY_5 => ('5', '%'),
+        KeyCode::KEY_6 => ('6', '^'),
+        KeyCode::KEY_7 => ('7', '&'),
+        KeyCode::KEY_8 => ('8', '*'),
+        KeyCode::KEY_9 => ('9', '('),
+        KeyCode::KEY_0 => ('0', ')'),
+        KeyCode::KEY_A => ('a', 'A'),
+        KeyCode::KEY_APOSTROPHE => ('\'', '"'),
+        KeyCode::KEY_B => ('b', 'B'),
+        KeyCode::KEY_BACKSLASH => ('\\', '|'),
+        KeyCode::KEY_C => ('c', 'C'),
+        KeyCode::KEY_COMMA => (',', '<'),
+        KeyCode::KEY_D => ('d', 'D'),
+        KeyCode::KEY_DOT => ('.', '>'),
+        KeyCode::KEY_E => ('e', 'E'),
+        KeyCode::KEY_EQUAL => ('=', '+'),
+        KeyCode::KEY_F => ('f', 'F'),
+        KeyCode::KEY_G => ('g', 'G'),
+        KeyCode::KEY_GRAVE => ('`', '~'),
+        KeyCode::KEY_H => ('h', 'H'),
+        KeyCode::KEY_I => ('i', 'I'),
+        KeyCode::KEY_J => ('j', 'J'),
+        KeyCode::KEY_K => ('k', 'K'),
+        KeyCode::KEY_KP1 => ('1', '!'),
+        KeyCode::KEY_KP2 => ('2', '@'),
+        KeyCode::KEY_KP3 => ('3', '#'),
+        KeyCode::KEY_KP4 => ('4', '$'),
+        KeyCode::KEY_KP5 => ('5', '%'),
+        KeyCode::KEY_KP6 => ('6', '^'),
+        KeyCode::KEY_KP7 => ('7', '&'),
+        KeyCode::KEY_KP8 => ('8', '*'),
+        KeyCode::KEY_KP9 => ('9', '('),
+        KeyCode::KEY_KP0 => ('0', ')'),
+        KeyCode::KEY_KPASTERISK => ('*', '*'), // TODO
+        KeyCode::KEY_KPDOT => ('.', '>'),
+        KeyCode::KEY_KPMINUS => ('-', '_'),
+        KeyCode::KEY_KPPLUS => ('=', '+'), // TODO
+        KeyCode::KEY_L => ('l', 'L'),
+        KeyCode::KEY_LEFTBRACE => ('[', '{'),
+        KeyCode::KEY_M => ('m', 'M'),
+        KeyCode::KEY_MINUS => ('-', '_'),
+        KeyCode::KEY_N => ('n', 'N'),
+        KeyCode::KEY_O => ('o', 'O'),
+        KeyCode::KEY_P => ('p', 'P'),
+        KeyCode::KEY_Q => ('q', 'Q'),
+        KeyCode::KEY_R => ('r', 'R'),
+        KeyCode::KEY_RIGHTBRACE => (']', '}'),
+        KeyCode::KEY_S => ('s', 'S'),
+        KeyCode::KEY_SEMICOLON => (';', ':'),
+        KeyCode::KEY_SLASH => ('/', '?'),
+        KeyCode::KEY_SPACE => (' ', ' '),
+        KeyCode::KEY_T => ('t', 'T'),
+        KeyCode::KEY_TAB => ('\t', '\t'),
+        KeyCode::KEY_U => ('u', 'U'),
+        KeyCode::KEY_V => ('v', 'V'),
+        KeyCode::KEY_W => ('w', 'W'),
+        KeyCode::KEY_X => ('x', 'X'),
+        KeyCode::KEY_Y => ('y', 'Y'),
+        KeyCode::KEY_Z => ('z', 'Z'),
+        _ => return None,
+    })
 }

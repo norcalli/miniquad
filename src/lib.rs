@@ -248,26 +248,22 @@ where
     {
         let mut f = Some(f);
         let f = &mut f;
-        match conf.platform.linux_backend {
-            conf::LinuxBackend::Drm => {
-                native::linux_drm::run(&conf, f).expect("DRM backend failed")
-            }
-            conf::LinuxBackend::X11Only => {
-                native::linux_x11::run(&conf, f).expect("X11 backend failed")
-            }
-            conf::LinuxBackend::WaylandOnly => {
-                native::linux_wayland::run(&conf, f).expect("Wayland backend failed")
-            }
-            conf::LinuxBackend::X11WithWaylandFallback => {
-                if native::linux_x11::run(&conf, f).is_none() {
-                    eprintln!("Failed to initialize through X11! Trying wayland instead");
-                    native::linux_wayland::run(&conf, f);
-                }
-            }
-            conf::LinuxBackend::WaylandWithX11Fallback => {
-                if native::linux_wayland::run(&conf, f).is_none() {
-                    eprintln!("Failed to initialize through wayland! Trying X11 instead");
-                    native::linux_x11::run(&conf, f);
+        let backends = if conf.platform.linux_backend.is_empty() {
+            eprintln!("No backends specified");
+            return;
+        } else {
+            conf.platform.linux_backend
+        };
+        for backend in backends {
+            let result = match backend {
+                conf::LinuxBackend::Drm => native::linux_drm::run(&conf, f),
+                conf::LinuxBackend::X11Only => native::linux_x11::run(&conf, f),
+                conf::LinuxBackend::WaylandOnly => native::linux_wayland::run(&conf, f),
+            };
+            match result {
+                Some(()) => return,
+                None => {
+                    eprintln!("{backend:?} backend failed.");
                 }
             }
         }

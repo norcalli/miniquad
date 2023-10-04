@@ -59,8 +59,6 @@ pub enum LinuxBackend {
     Drm,
     X11Only,
     WaylandOnly,
-    X11WithWaylandFallback,
-    WaylandWithX11Fallback,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -83,7 +81,7 @@ pub struct Platform {
     /// all, like KMS) - will panic.
     ///
     /// Defaults to X11Only. Wayland implementation is way too unstable right now.
-    pub linux_backend: LinuxBackend,
+    pub linux_backend: &'static [LinuxBackend],
 
     /// Which rendering context to create, Metal or OpenGL.
     /// Miniquad always links with Metal.framework (assuming it is always present)
@@ -115,7 +113,7 @@ impl Default for Platform {
         Platform {
             linux_x11_gl: LinuxX11Gl::GLXWithEGLFallback,
             swap_interval: None,
-            linux_backend: LinuxBackend::X11Only,
+            linux_backend: &[LinuxBackend::X11Only],
             apple_gfx_api: AppleGfxApi::OpenGl,
             framebuffer_alpha: false,
             wayland_use_fallback_decorations: true,

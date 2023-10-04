@@ -36,3 +36,7 @@ objc = "0.2"
 [dev-dependencies]
 glam = {version = "0.24", features = ["scalar-math"] }
 quad-rand = "0.1"
+
+[dependencies]
+anyhow = "1.0.75"
+keyboard-layouts = "0.3.0"
