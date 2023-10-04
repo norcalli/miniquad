@@ -56,6 +56,7 @@ pub enum LinuxX11Gl {
 
 #[derive(Debug)]
 pub enum LinuxBackend {
+    Drm,
     X11Only,
     WaylandOnly,
     X11WithWaylandFallback,

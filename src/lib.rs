@@ -249,6 +249,9 @@ where
         let mut f = Some(f);
         let f = &mut f;
         match conf.platform.linux_backend {
+            conf::LinuxBackend::Drm => {
+                native::linux_drm::run(&conf, f).expect("DRM backend failed")
+            }
             conf::LinuxBackend::X11Only => {
                 native::linux_x11::run(&conf, f).expect("X11 backend failed")
             }

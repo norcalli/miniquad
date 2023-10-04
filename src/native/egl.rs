@@ -1,5 +1,7 @@
 #![allow(non_camel_case_types, non_snake_case, dead_code)]
 
+use libc::c_void;
+
 use crate::native::module;
 
 #[cfg(target_os = "linux")]
@@ -34,17 +36,40 @@ pub const EGL_HEIGHT: u32 = 12374;
 pub const EGL_SURFACE_TYPE: u32 = 12339;
 pub const EGL_NONE: u32 = 12344;
 pub const EGL_CONTEXT_CLIENT_VERSION: u32 = 12440;
+pub const EGL_PLATFORM_GBM_MESA: u32 = 0x31D7;
+pub const EGL_EXTENSIONS: u32 = 0x3055;
+pub const EGL_CLIENT_APIS: u32 = 0x308D;
+pub const EGL_VENDOR: u32 = 0x3053;
+pub const EGL_VERSION: u32 = 0x3054;
+pub const EGL_NO_DISPLAY: EGLDisplay = std::ptr::null_mut();
 
 pub type NativeDisplayType = EGLNativeDisplayType;
 pub type NativePixmapType = EGLNativePixmapType;
 pub type NativeWindowType = EGLNativeWindowType;
 pub type EGLint = i32;
+// TODO double check
+pub type EGLenum = i32;
 pub type EGLBoolean = ::std::os::raw::c_uint;
 pub type EGLDisplay = *mut ::std::os::raw::c_void;
 pub type EGLConfig = *mut ::std::os::raw::c_void;
 pub type EGLSurface = *mut ::std::os::raw::c_void;
 pub type EGLContext = *mut ::std::os::raw::c_void;
 pub type __eglMustCastToProperFunctionPointerType = ::std::option::Option<unsafe extern "C" fn()>;
+pub type PFNEGLGETPLATFORMDISPLAYEXTPROC = ::std::option::Option<
+    unsafe extern "C" fn(
+        platform: EGLenum,
+        native_display: *const c_void,
+        attrib_list: *const EGLint,
+    ) -> EGLDisplay,
+>;
+pub type PFNEGLCREATEPLATFORMWINDOWSURFACEEXTPROC = ::std::option::Option<
+    unsafe extern "C" fn(
+        dpy: EGLDisplay,
+        config: EGLConfig,
+        native_window: *const c_void,
+        attrib_list: *const EGLint,
+    ) -> EGLSurface,
+>;
 pub type PFNEGLCHOOSECONFIGPROC = ::std::option::Option<
     unsafe extern "C" fn(
         dpy: EGLDisplay,
@@ -207,42 +232,55 @@ pub struct LibEgl {
     pub eglReleaseTexImage: PFNEGLRELEASETEXIMAGEPROC,
     pub eglSurfaceAttrib: PFNEGLSURFACEATTRIBPROC,
     pub eglSwapInterval: PFNEGLSWAPINTERVALPROC,
+    pub eglGetPlatformDisplayEXT: PFNEGLGETPLATFORMDISPLAYEXTPROC,
+    pub eglCreatePlatformWindowSurfaceEXT: PFNEGLCREATEPLATFORMWINDOWSURFACEEXTPROC,
 }
 
 impl LibEgl {
     pub fn try_load() -> Option<LibEgl> {
         module::Module::load("libEGL.so")
             .or_else(|_| module::Module::load("libEGL.so.1"))
-            .map(|module| LibEgl {
-                eglChooseConfig: module.get_symbol("eglChooseConfig").ok(),
-                eglCopyBuffers: module.get_symbol("eglCopyBuffers").ok(),
-                eglCreateContext: module.get_symbol("eglCreateContext").ok(),
-                eglCreatePbufferSurface: module.get_symbol("eglCreatePbufferSurface").ok(),
-                eglCreatePixmapSurface: module.get_symbol("eglCreatePixmapSurface").ok(),
-                eglCreateWindowSurface: module.get_symbol("eglCreateWindowSurface").ok(),
-                eglDestroyContext: module.get_symbol("eglDestroyContext").ok(),
-                eglDestroySurface: module.get_symbol("eglDestroySurface").ok(),
-                eglGetConfigAttrib: module.get_symbol("eglGetConfigAttrib").ok(),
-                eglGetConfigs: module.get_symbol("eglGetConfigs").ok(),
-                eglGetCurrentDisplay: module.get_symbol("eglGetCurrentDisplay").ok(),
-                eglGetCurrentSurface: module.get_symbol("eglGetCurrentSurface").ok(),
-                eglGetDisplay: module.get_symbol("eglGetDisplay").ok(),
-                eglGetError: module.get_symbol("eglGetError").ok(),
-                eglGetProcAddress: module.get_symbol("eglGetProcAddress").ok(),
-                eglInitialize: module.get_symbol("eglInitialize").ok(),
-                eglMakeCurrent: module.get_symbol("eglMakeCurrent").ok(),
-                eglQueryContext: module.get_symbol("eglQueryContext").ok(),
-                eglQueryString: module.get_symbol("eglQueryString").ok(),
-                eglQuerySurface: module.get_symbol("eglQuerySurface").ok(),
-                eglSwapBuffers: module.get_symbol("eglSwapBuffers").ok(),
-                eglTerminate: module.get_symbol("eglTerminate").ok(),
-                eglWaitGL: module.get_symbol("eglWaitGL").ok(),
-                eglWaitNative: module.get_symbol("eglWaitNative").ok(),
-                eglBindTexImage: module.get_symbol("eglBindTexImage").ok(),
-                eglReleaseTexImage: module.get_symbol("eglReleaseTexImage").ok(),
-                eglSurfaceAttrib: module.get_symbol("eglSurfaceAttrib").ok(),
-                eglSwapInterval: module.get_symbol("eglSwapInterval").ok(),
-                module,
+            .map(|module| {
+                let eglGetProcAddress = module.get_symbol("eglGetProcAddress").ok();
+                LibEgl {
+                    eglChooseConfig: module.get_symbol("eglChooseConfig").ok(),
+                    eglCopyBuffers: module.get_symbol("eglCopyBuffers").ok(),
+                    eglCreateContext: module.get_symbol("eglCreateContext").ok(),
+                    eglCreatePbufferSurface: module.get_symbol("eglCreatePbufferSurface").ok(),
+                    eglCreatePixmapSurface: module.get_symbol("eglCreatePixmapSurface").ok(),
+                    eglCreateWindowSurface: module.get_symbol("eglCreateWindowSurface").ok(),
+                    eglDestroyContext: module.get_symbol("eglDestroyContext").ok(),
+                    eglDestroySurface: module.get_symbol("eglDestroySurface").ok(),
+                    eglGetConfigAttrib: module.get_symbol("eglGetConfigAttrib").ok(),
+                    eglGetConfigs: module.get_symbol("eglGetConfigs").ok(),
+                    eglGetCurrentDisplay: module.get_symbol("eglGetCurrentDisplay").ok(),
+                    eglGetCurrentSurface: module.get_symbol("eglGetCurrentSurface").ok(),
+                    eglGetDisplay: module.get_symbol("eglGetDisplay").ok(),
+                    eglGetError: module.get_symbol("eglGetError").ok(),
+                    eglGetProcAddress,
+                    eglInitialize: module.get_symbol("eglInitialize").ok(),
+                    eglMakeCurrent: module.get_symbol("eglMakeCurrent").ok(),
+                    eglQueryContext: module.get_symbol("eglQueryContext").ok(),
+                    eglQueryString: module.get_symbol("eglQueryString").ok(),
+                    eglQuerySurface: module.get_symbol("eglQuerySurface").ok(),
+                    eglSwapBuffers: module.get_symbol("eglSwapBuffers").ok(),
+                    eglTerminate: module.get_symbol("eglTerminate").ok(),
+                    eglWaitGL: module.get_symbol("eglWaitGL").ok(),
+                    eglWaitNative: module.get_symbol("eglWaitNative").ok(),
+                    eglBindTexImage: module.get_symbol("eglBindTexImage").ok(),
+                    eglReleaseTexImage: module.get_symbol("eglReleaseTexImage").ok(),
+                    eglSurfaceAttrib: module.get_symbol("eglSurfaceAttrib").ok(),
+                    eglSwapInterval: module.get_symbol("eglSwapInterval").ok(),
+                    eglGetPlatformDisplayEXT: eglGetProcAddress
+                        .and_then(|f| unsafe { (f)("eglGetPlatformDisplayEXT\0".as_ptr() as _) })
+                        .map(|p| unsafe { std::mem::transmute(p) }),
+                    eglCreatePlatformWindowSurfaceEXT: eglGetProcAddress
+                        .and_then(|f| unsafe {
+                            (f)("eglCreatePlatformWindowSurfaceEXT\0".as_ptr() as _)
+                        })
+                        .map(|p| unsafe { std::mem::transmute(p) }),
+                    module,
+                }
             })
             .ok()
     }
@@ -258,14 +296,20 @@ pub enum EglError {
 pub struct Egl {}
 
 pub unsafe fn create_egl_context(
-    egl: &mut LibEgl,
+    egl: &LibEgl,
     display: *mut std::ffi::c_void,
     alpha: bool,
+    should_get_display: bool,
 ) -> Result<(EGLContext, EGLConfig, EGLDisplay), EglError> {
-    let display = (egl.eglGetDisplay.unwrap())(display as _);
-    if display == /* EGL_NO_DISPLAY */ null_mut() {
-        return Err(EglError::NoDisplay);
-    }
+    let display = if should_get_display {
+        let display = (egl.eglGetDisplay.unwrap())(display as _);
+        if display == /* EGL_NO_DISPLAY */ null_mut() {
+            return Err(EglError::NoDisplay);
+        }
+        display
+    } else {
+        display
+    };
 
     if (egl.eglInitialize.unwrap())(display, null_mut(), null_mut()) == 0 {
         return Err(EglError::InitializeFailed);
@@ -324,6 +368,10 @@ pub unsafe fn create_egl_context(
     if !exact_cfg_found {
         config = available_cfgs[0];
     }
+    // use EGL_KHR_create_context if you want to debug context together with GL_KHR_debug
+    // EGL_CONTEXT_FLAGS_KHR, EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR,
+    // use EGL_KHR_create_context_no_error for "production" builds, may improve performance
+    // EGL_CONTEXT_OPENGL_NO_ERROR_KHR, EGL_TRUE,
     let ctx_attributes = vec![EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE];
     let context = (egl.eglCreateContext.unwrap())(
         display,
