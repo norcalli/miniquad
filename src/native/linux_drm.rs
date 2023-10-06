@@ -684,6 +684,56 @@ where
             libegl.eglGetProcAddress.expect("non-null function pointer")(name.as_ptr() as _)
         });
 
+        let glGetString = |code| {
+            CStr::from_ptr(crate::native::gl::glGetString(code) as *const i8).to_string_lossy()
+        };
+        use crate::native::gl;
+        pub type GlCallbackFn = unsafe extern "C" fn(
+            source: gl::GLenum,
+            ty: gl::GLenum,
+            id: gl::GLuint,
+            severity: gl::GLenum,
+            length: gl::GLsizei,
+            message: *const gl::GLchar,
+            user: *const c_void,
+        );
+        pub type glDebugMessageCallback = unsafe extern "C" fn(GlCallbackFn, *const c_void);
+        unsafe extern "C" fn debug_callback(
+            source: gl::GLenum,
+            ty: gl::GLenum,
+            id: gl::GLuint,
+            severity: gl::GLenum,
+            length: gl::GLsizei,
+            message: *const gl::GLchar,
+            user: *const c_void,
+        ) {
+            eprintln!(
+                "GL CALLBACK: {} type = 0x{ty:x}, severity = 0x{severity:x}, message = {}",
+                if ty == GL_DEBUG_TYPE_ERROR {
+                    "** GL ERROR **"
+                } else {
+                    ""
+                },
+                CStr::from_ptr(message).to_string_lossy()
+            );
+        }
+        pub const GL_DEBUG_TYPE_ERROR: u32 = 0x824C;
+        pub const GL_DEBUG_OUTPUT: u32 = 0x92E0;
+        pub const GL_DEBUG_OUTPUT_SYNCHRONOUS: u32 = 0x8242;
+        let glDebugMessageCallback: Option<glDebugMessageCallback> =
+            libegl.eglGetProcAddress.expect("non-null function pointer")(
+                "glDebugMessageCallback\0".as_ptr() as _,
+            )
+            .map(|p| unsafe { std::mem::transmute(p) });
+        // gl::glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
+        // glDebugMessageCallback.unwrap()(debug_callback, null());
+
+        eprintln!("GL_VENDOR = {}", glGetString(gl::GL_VENDOR));
+        // eprintln!("GL_RENDERER = {}", glGetString(gl::GL_RENDERER));
+        eprintln!("GL_RENDERER = {}", glGetString(0x1F01));
+        eprintln!("GL_VERSION = {}", glGetString(gl::GL_VERSION));
+        eprintln!("GL_EXTENSIONS = {}", glGetString(gl::GL_EXTENSIONS));
+
         let (tx, rx) = std::sync::mpsc::channel();
         // let clipboard = Box::new(clipboard::X11Clipboard::new(
         //     display.libx11.clone(),
@@ -754,8 +804,9 @@ where
                     panic!("Poll error: {}", strerror(errno).to_str().unwrap());
                 }
                 if (poll.revents & libc::POLLIN) != 0 {
-                    // TODO check result
-                    (libdrm.drmHandleEvent)(drm_fd, &page_flip_ctx);
+                    (libdrm.drmHandleEvent)(drm_fd, &page_flip_ctx)
+                        .anyhow("drmHandleEvent")
+                        .unwrap();
                 } else if count == 0 {
                     // timeout reached
                     return false;
@@ -827,19 +878,19 @@ where
              * page-flip is done.
              */
             pub const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x1;
-            if (libdrm.drmModePageFlip)(
+            (libdrm.drmModePageFlip)(
                 drm_fd,
                 crtc.crtc_id,
                 fb,
                 DRM_MODE_PAGE_FLIP_EVENT,
                 null_mut(),
             )
-            .ok_or_errno()
-            // TODO throw error?
-            .is_ok()
-            {
-                WAITING_FOR_PAGE_FLIP.store(true, Ordering::SeqCst);
-            }
+            // .ok_or_errno()
+            // // TODO throw error?
+            // .is_ok()
+            .anyhow("drmModePageFlip")
+            .unwrap();
+            WAITING_FOR_PAGE_FLIP.store(true, Ordering::SeqCst);
         };
 
         let mut event_handler = (f.take().unwrap())();
@@ -883,6 +934,111 @@ where
                 revents: 0,
             });
         }
+        #[derive(Debug)]
+        struct Ema0 {
+            value: f64,
+        }
+        impl Ema0 {
+            pub fn new(value: f64) -> Self {
+                Self { value }
+            }
+
+            pub fn update(&mut self, value: f64, alpha: f64) {
+                self.value += (value - self.value) * alpha;
+            }
+
+            pub fn value(&self) -> f64 {
+                self.value
+            }
+        }
+        fn make_alpha_f64(sample_interval: f64, tau: f64) -> f64 {
+            assert!(tau >= 0.0);
+            if tau == 0.0 {
+                return 1.0;
+            }
+            1.0 - f64::exp(-sample_interval / tau)
+        }
+        pub struct Debounced {
+            last_time: Option<Instant>,
+            interval: std::time::Duration,
+        }
+
+        impl Debounced {
+            pub const fn new(interval: std::time::Duration) -> Self {
+                Self {
+                    last_time: None,
+                    interval,
+                }
+            }
+
+            pub fn debounced<T>(&mut self, mut f: impl FnMut() -> T) -> Option<T> {
+                let now = Instant::now();
+                match self.last_time {
+                    Some(last_time) if now.duration_since(last_time) >= self.interval => {
+                        self.last_time = Some(now);
+                        Some(f())
+                    }
+                    None => {
+                        self.last_time = Some(now);
+                        Some(f())
+                    }
+                    _ => None,
+                }
+            }
+        }
+
+        pub struct Ticker {
+            name: &'static str,
+            ema: Ema0,
+            total: f64,
+            count: f64,
+            start: Instant,
+            last_update: Instant,
+            ticket: Debounced,
+        }
+        impl Ticker {
+            pub fn new(name: &'static str) -> Self {
+                Self {
+                    name,
+                    ema: Ema0::new(0.0),
+                    ticket: Debounced::new(Duration::from_secs(1)),
+                    last_update: Instant::now(),
+                    start: Instant::now(),
+                    total: 0.0,
+                    count: 0.0,
+                }
+            }
+
+            pub fn start(&mut self) {
+                self.start = Instant::now();
+            }
+            pub fn stop(&mut self) {
+                let ts = self.last_update.elapsed().as_secs_f64();
+                let value = self.start.elapsed().as_secs_f64();
+                self.ema.update(value, make_alpha_f64(ts, 1.0));
+                self.total += value;
+                self.count += 1.0;
+                self.last_update = Instant::now();
+                let name = self.name;
+                let ema = &self.ema;
+                let avg = self.total / self.count * 1000.0;
+                if self
+                    .ticket
+                    .debounced(|| {
+                        eprintln!("{name:16}: {:8.2}ms | {avg:8.2}ms", ema.value() * 1000.0);
+                    })
+                    .is_some()
+                {
+                    self.total = 0.0;
+                    self.count = 0.0;
+                }
+            }
+        }
+        let mut read_ticker = Ticker::new("Read");
+        let mut present_ticker = Ticker::new("Present");
+        let mut flip_ticker = Ticker::new("Flip");
+        let mut event_handler_ticker = Ticker::new("event_handler.update");
+        let mut event_handler_draw_ticker = Ticker::new("event_handler.draw");
         'main: while !crate::native_display().try_lock().unwrap().quit_ordered {
             if keyboards.is_empty() && start.elapsed().as_secs() > 1 {
                 break;
@@ -912,10 +1068,11 @@ where
                 // dbg!(request);
             }
             {
+                read_ticker.start();
                 for poll in poll.iter_mut() {
                     poll.revents = 0;
                 }
-                let timeout = Duration::from_millis(3);
+                let timeout = Duration::from_millis(0);
                 // TODO what unit is timeout?
                 let count = libc::poll(
                     poll.as_mut_ptr(),
@@ -939,262 +1096,293 @@ where
                         type_: 0,
                         code: 0,
                         value: 0,
-                    }; 16];
+                    }; 128];
                     for (poll, kbd) in poll.iter().zip(keyboards.iter_mut()) {
                         if (poll.revents & libc::POLLIN) != 0 {
-                            match read_input_events(poll, &mut event_buf) {
-                                Ok(events) => {
-                                    for event in events.iter() {
-                                        if let Some((keycode, action)) = key_from_event(event) {
-                                            if action != KeyAction::Repeat {
-                                                match keycode {
-                                                    KeyCode::KEY_LEFTCTRL
-                                                    | KeyCode::KEY_RIGHTCTRL => {
-                                                        kbd.key_mods.ctrl = action != KeyAction::Up;
+                            loop {
+                                match read_input_events(poll, &mut event_buf) {
+                                    Ok(events) if events.is_empty() => break,
+                                    Ok(events) => {
+                                        for event in events.iter() {
+                                            if let Some((keycode, action)) = key_from_event(event) {
+                                                if action != KeyAction::Repeat {
+                                                    match keycode {
+                                                        KeyCode::KEY_LEFTCTRL
+                                                        | KeyCode::KEY_RIGHTCTRL => {
+                                                            kbd.key_mods.ctrl =
+                                                                action != KeyAction::Up;
+                                                        }
+                                                        KeyCode::KEY_LEFTALT
+                                                        | KeyCode::KEY_RIGHTALT => {
+                                                            kbd.key_mods.alt =
+                                                                action != KeyAction::Up;
+                                                        }
+                                                        KeyCode::KEY_LEFTSHIFT
+                                                        | KeyCode::KEY_RIGHTSHIFT => {
+                                                            kbd.key_mods.shift =
+                                                                action != KeyAction::Up;
+                                                        }
+                                                        KeyCode::KEY_LEFTMETA
+                                                        | KeyCode::KEY_RIGHTMETA => {
+                                                            kbd.key_mods.logo =
+                                                                action != KeyAction::Up;
+                                                        }
+                                                        // key if key >= KeyCode::KEY_A
+                                                        //     && key <= KeyCode::KEY_Z
+                                                        //     && action != KeyAction::Up =>
+                                                        // {
+                                                        //     let offset = keycode as u8
+                                                        //         - KeyCode::KEY_A as u8
+                                                        //         + if kbd.key_mods.shift {
+                                                        //             b'A'
+                                                        //         } else {
+                                                        //             b'a'
+                                                        //         };
+                                                        //     event_handler.char_event(
+                                                        //         offset as char,
+                                                        //         kbd.key_mods,
+                                                        //         action == KeyAction::Repeat,
+                                                        //     );
+                                                        // }
+                                                        _ => (),
                                                     }
-                                                    KeyCode::KEY_LEFTALT
-                                                    | KeyCode::KEY_RIGHTALT => {
-                                                        kbd.key_mods.alt = action != KeyAction::Up;
-                                                    }
-                                                    KeyCode::KEY_LEFTSHIFT
-                                                    | KeyCode::KEY_RIGHTSHIFT => {
-                                                        kbd.key_mods.shift =
-                                                            action != KeyAction::Up;
-                                                    }
-                                                    KeyCode::KEY_LEFTMETA
-                                                    | KeyCode::KEY_RIGHTMETA => {
-                                                        kbd.key_mods.logo = action != KeyAction::Up;
-                                                    }
-                                                    // key if key >= KeyCode::KEY_A
-                                                    //     && key <= KeyCode::KEY_Z
-                                                    //     && action != KeyAction::Up =>
-                                                    // {
-                                                    //     let offset = keycode as u8
-                                                    //         - KeyCode::KEY_A as u8
-                                                    //         + if kbd.key_mods.shift {
-                                                    //             b'A'
-                                                    //         } else {
-                                                    //             b'a'
-                                                    //         };
-                                                    //     event_handler.char_event(
-                                                    //         offset as char,
-                                                    //         kbd.key_mods,
-                                                    //         action == KeyAction::Repeat,
-                                                    //     );
-                                                    // }
-                                                    _ => (),
                                                 }
-                                            }
-                                            if action == KeyAction::Repeat
-                                                || action == KeyAction::Down
-                                            {
-                                                if let Some((c, shift_c)) =
-                                                    chars_from_keycode(keycode)
+                                                if action == KeyAction::Repeat
+                                                    || action == KeyAction::Down
                                                 {
-                                                    let c = if kbd.key_mods.shift {
-                                                        shift_c
-                                                    } else {
-                                                        c
-                                                    };
-                                                    event_handler.char_event(
-                                                        c,
-                                                        kbd.key_mods,
-                                                        action == KeyAction::Repeat,
-                                                    );
-                                                }
-                                            }
-                                            fn shortmods(
-                                                buffer: &mut [u8; 4],
-                                                mods: KeyMods,
-                                            ) -> &str {
-                                                let mut len = 0;
-                                                if mods.alt {
-                                                    buffer[len] = b'A';
-                                                    len += 1;
-                                                }
-                                                if mods.shift {
-                                                    buffer[len] = b'S';
-                                                    len += 1;
-                                                }
-                                                if mods.ctrl {
-                                                    buffer[len] = b'C';
-                                                    len += 1;
-                                                }
-                                                if mods.logo {
-                                                    buffer[len] = b'M';
-                                                    len += 1;
-                                                }
-                                                unsafe {
-                                                    std::str::from_utf8_unchecked(&buffer[..len])
-                                                }
-                                            }
-                                            // crate::debug!(
-                                            //     "Key: {:4} {:?}",
-                                            //     shortmods(&mut [0u8; 4], kbd.key_mods),
-                                            //     (action, keycode)
-                                            // );
-                                            if {
-                                                let m = kbd.key_mods;
-                                                m.alt && m.ctrl && m.shift && m.logo
-                                            } && action == KeyAction::Down
-                                                && keycode == KeyCode::KEY_ESC
-                                            {
-                                                break 'main;
-                                            }
-                                            if let Some(keycode) = keycode.to_macroquad_keycode() {
-                                                match action {
-                                                    KeyAction::Up => {
-                                                        event_handler
-                                                            .key_up_event(keycode, kbd.key_mods);
-                                                    }
-                                                    KeyAction::Down => {
-                                                        event_handler.key_down_event(
-                                                            keycode,
+                                                    if let Some((c, shift_c)) =
+                                                        chars_from_keycode(keycode)
+                                                    {
+                                                        let c = if kbd.key_mods.shift {
+                                                            shift_c
+                                                        } else {
+                                                            c
+                                                        };
+                                                        event_handler.char_event(
+                                                            c,
                                                             kbd.key_mods,
-                                                            false,
-                                                        );
-                                                    }
-                                                    KeyAction::Repeat => {
-                                                        event_handler
-                                                            .key_up_event(keycode, kbd.key_mods);
-                                                        event_handler.key_down_event(
-                                                            keycode,
-                                                            kbd.key_mods,
-                                                            false,
-                                                            // true,
+                                                            action == KeyAction::Repeat,
                                                         );
                                                     }
                                                 }
+                                                fn shortmods(
+                                                    buffer: &mut [u8; 4],
+                                                    mods: KeyMods,
+                                                ) -> &str
+                                                {
+                                                    let mut len = 0;
+                                                    if mods.alt {
+                                                        buffer[len] = b'A';
+                                                        len += 1;
+                                                    }
+                                                    if mods.shift {
+                                                        buffer[len] = b'S';
+                                                        len += 1;
+                                                    }
+                                                    if mods.ctrl {
+                                                        buffer[len] = b'C';
+                                                        len += 1;
+                                                    }
+                                                    if mods.logo {
+                                                        buffer[len] = b'M';
+                                                        len += 1;
+                                                    }
+                                                    unsafe {
+                                                        std::str::from_utf8_unchecked(
+                                                            &buffer[..len],
+                                                        )
+                                                    }
+                                                }
+                                                // crate::debug!(
+                                                //     "Key: {:4} {:?}",
+                                                //     shortmods(&mut [0u8; 4], kbd.key_mods),
+                                                //     (action, keycode)
+                                                // );
+                                                if {
+                                                    let m = kbd.key_mods;
+                                                    m.alt && m.ctrl && m.shift && m.logo
+                                                } && action == KeyAction::Down
+                                                    && keycode == KeyCode::KEY_ESC
+                                                {
+                                                    break 'main;
+                                                }
+                                                if let Some(keycode) =
+                                                    keycode.to_macroquad_keycode()
+                                                {
+                                                    match action {
+                                                        KeyAction::Up => {
+                                                            event_handler.key_up_event(
+                                                                keycode,
+                                                                kbd.key_mods,
+                                                            );
+                                                        }
+                                                        KeyAction::Down => {
+                                                            event_handler.key_down_event(
+                                                                keycode,
+                                                                kbd.key_mods,
+                                                                false,
+                                                            );
+                                                        }
+                                                        KeyAction::Repeat => {
+                                                            // event_handler.key_up_event(
+                                                            //     keycode,
+                                                            //     kbd.key_mods,
+                                                            // );
+                                                            // event_handler.key_down_event(
+                                                            //     keycode,
+                                                            //     kbd.key_mods,
+                                                            //     false,
+                                                            //     // true,
+                                                            // );
+                                                            event_handler.key_down_event(
+                                                                keycode,
+                                                                kbd.key_mods,
+                                                                true,
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                // eprintln!(
+                                                //     "key event: name: {}, input_event: {:?}",
+                                                //     kbd.name,
+                                                //     (keycode, action)
+                                                // );
                                             }
-                                            // eprintln!(
-                                            //     "key event: name: {}, input_event: {:?}",
-                                            //     kbd.name,
-                                            //     (keycode, action)
-                                            // );
                                         }
                                     }
-                                }
-                                Err(errno) => {
-                                    eprintln!(
-                                        "Failed to read from {}: {}",
-                                        kbd.name,
-                                        strerror(errno).to_string_lossy()
-                                    );
+                                    Err(libc::EINTR | libc::EAGAIN) => break,
+                                    Err(errno) => {
+                                        eprintln!(
+                                            "Failed to read from {}: {errno} = {}",
+                                            kbd.name,
+                                            strerror(errno).to_string_lossy()
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
                     for (poll, mouse) in poll.iter().skip(keyboards.len()).zip(mice.iter_mut()) {
                         if (poll.revents & libc::POLLIN) != 0 {
-                            match read_input_events(poll, &mut event_buf) {
-                                Ok(events) => {
-                                    let old_pos = (mouse.x, mouse.y);
-                                    let mut touch_x = None;
-                                    let mut touch_y = None;
-                                    for event in events.iter() {
-                                        // eprintln!(
-                                        //     "mouse {}. type: {}. code: {}, value: {}",
-                                        //     mouse.name, event.type_, event.code, event.value
-                                        // );
-                                        if event.type_ == EventType::EV_ABS as u16 {
-                                            // eprintln!("ABS: {}, {}", event.code, event.value);
-                                            match event.code {
-                                                x if x == AbsAxis::ABS_X as u16 => {
-                                                    let abs_screen_pos = event.value as f32;
-                                                    // / mouse.x_abs_info.maximum as f32
-                                                    // * w as f32;
-                                                    let pos = touch_x.get_or_insert((
-                                                        abs_screen_pos,
-                                                        abs_screen_pos,
-                                                    ));
-                                                    pos.1 = abs_screen_pos;
+                            loop {
+                                match read_input_events(poll, &mut event_buf) {
+                                    Ok(events) if events.is_empty() => break,
+                                    Ok(events) => {
+                                        let old_pos = (mouse.x, mouse.y);
+                                        let mut touch_x = None;
+                                        let mut touch_y = None;
+                                        for event in events.iter() {
+                                            // eprintln!(
+                                            //     "mouse {}. type: {}. code: {}, value: {}",
+                                            //     mouse.name, event.type_, event.code, event.value
+                                            // );
+                                            if event.type_ == EventType::EV_ABS as u16 {
+                                                // eprintln!("ABS: {}, {}", event.code, event.value);
+                                                match event.code {
+                                                    x if x == AbsAxis::ABS_X as u16 => {
+                                                        let abs_screen_pos = event.value as f32;
+                                                        // / mouse.x_abs_info.maximum as f32
+                                                        // * w as f32;
+                                                        let pos = touch_x.get_or_insert((
+                                                            abs_screen_pos,
+                                                            abs_screen_pos,
+                                                        ));
+                                                        pos.1 = abs_screen_pos;
+                                                    }
+                                                    x if x == AbsAxis::ABS_Y as u16 => {
+                                                        let abs_screen_pos = event.value as f32;
+                                                        // / mouse.y_abs_info.maximum as f32
+                                                        // * h as f32;
+                                                        let pos = touch_y.get_or_insert((
+                                                            abs_screen_pos,
+                                                            abs_screen_pos,
+                                                        ));
+                                                        pos.1 = abs_screen_pos;
+                                                    }
+                                                    _ => (),
                                                 }
-                                                x if x == AbsAxis::ABS_Y as u16 => {
-                                                    let abs_screen_pos = event.value as f32;
-                                                    // / mouse.y_abs_info.maximum as f32
-                                                    // * h as f32;
-                                                    let pos = touch_y.get_or_insert((
-                                                        abs_screen_pos,
-                                                        abs_screen_pos,
-                                                    ));
-                                                    pos.1 = abs_screen_pos;
+                                            } else if event.type_ == EventType::EV_REL as u16 {
+                                                match event.code {
+                                                    x if x == RelAxis::REL_X as u16 => {
+                                                        mouse.x += event.value as f32;
+                                                    }
+                                                    x if x == RelAxis::REL_Y as u16 => {
+                                                        mouse.y += event.value as f32;
+                                                    }
+                                                    _ => (),
                                                 }
-                                                _ => (),
                                             }
-                                        } else if event.type_ == EventType::EV_REL as u16 {
-                                            match event.code {
-                                                x if x == RelAxis::REL_X as u16 => {
-                                                    mouse.x += event.value as f32;
+                                        }
+                                        let (touch_start_x, touch_stop_x) =
+                                            touch_x.unwrap_or_default();
+                                        let (touch_start_y, touch_stop_y) =
+                                            touch_y.unwrap_or_default();
+                                        mouse.x += (touch_stop_x - touch_start_x);
+                                        mouse.y += (touch_stop_y - touch_start_y);
+                                        mouse.x = mouse.x.clamp(0.0, w as f32);
+                                        mouse.y = mouse.y.clamp(0.0, h as f32);
+                                        if old_pos != (mouse.x, mouse.y) {
+                                            if cursor.is_some() {
+                                                (libdrm.drmModeMoveCursor)(
+                                                    drm_fd,
+                                                    crtc.crtc_id,
+                                                    mouse.x as i32,
+                                                    mouse.y as i32,
+                                                )
+                                                .anyhow("drmModeMoveCursor")
+                                                // TODO
+                                                .map_err(|err| eprintln!("Failed to move cursor"));
+                                            }
+                                            // event_handler.mouse_motion_event(mouse.x, mouse.y);
+                                            event_handler.mouse_motion_event(
+                                                mouse.x,
+                                                mouse.y,
+                                                // mouse.x - old_pos.0,
+                                                // mouse.y - old_pos.1,
+                                            );
+                                        }
+                                        for event in events.iter() {
+                                            if event.type_ == EventType::EV_KEY as u16 {
+                                                let button =
+                                                    if event.code == MouseButton::BTN_LEFT as u16 {
+                                                        crate::MouseButton::Left
+                                                    } else if event.code
+                                                        == MouseButton::BTN_RIGHT as u16
+                                                    {
+                                                        crate::MouseButton::Right
+                                                    } else if event.code
+                                                        == MouseButton::BTN_MIDDLE as u16
+                                                    {
+                                                        crate::MouseButton::Middle
+                                                    } else {
+                                                        continue;
+                                                    };
+                                                if event.value == 0 {
+                                                    event_handler.mouse_button_up_event(
+                                                        button, mouse.x, mouse.y,
+                                                    );
+                                                } else {
+                                                    event_handler.mouse_button_down_event(
+                                                        button, mouse.x, mouse.y,
+                                                    );
                                                 }
-                                                x if x == RelAxis::REL_Y as u16 => {
-                                                    mouse.y += event.value as f32;
-                                                }
-                                                _ => (),
                                             }
                                         }
                                     }
-                                    let (touch_start_x, touch_stop_x) = touch_x.unwrap_or_default();
-                                    let (touch_start_y, touch_stop_y) = touch_y.unwrap_or_default();
-                                    mouse.x += (touch_stop_x - touch_start_x);
-                                    mouse.y += (touch_stop_y - touch_start_y);
-                                    mouse.x = mouse.x.clamp(0.0, w as f32);
-                                    mouse.y = mouse.y.clamp(0.0, h as f32);
-                                    if old_pos != (mouse.x, mouse.y) {
-                                        if cursor.is_some() {
-                                            (libdrm.drmModeMoveCursor)(
-                                                drm_fd,
-                                                crtc.crtc_id,
-                                                mouse.x as i32,
-                                                mouse.y as i32,
-                                            )
-                                            .anyhow("drmModeMoveCursor")
-                                            // TODO
-                                            .map_err(|err| eprintln!("Failed to move cursor"));
-                                        }
-                                        // event_handler.mouse_motion_event(mouse.x, mouse.y);
-                                        event_handler.mouse_motion_event(
-                                            mouse.x,
-                                            mouse.y,
-                                            // mouse.x - old_pos.0,
-                                            // mouse.y - old_pos.1,
+                                    Err(libc::EINTR | libc::EAGAIN) => break,
+                                    Err(errno) => {
+                                        eprintln!(
+                                            "Failed to read from {}: {errno} = {}",
+                                            mouse.name,
+                                            strerror(errno).to_string_lossy()
                                         );
                                     }
-                                    for event in events.iter() {
-                                        if event.type_ == EventType::EV_KEY as u16 {
-                                            let button = if event.code
-                                                == MouseButton::BTN_LEFT as u16
-                                            {
-                                                crate::MouseButton::Left
-                                            } else if event.code == MouseButton::BTN_RIGHT as u16 {
-                                                crate::MouseButton::Right
-                                            } else if event.code == MouseButton::BTN_MIDDLE as u16 {
-                                                crate::MouseButton::Middle
-                                            } else {
-                                                continue;
-                                            };
-                                            if event.value == 0 {
-                                                event_handler.mouse_button_up_event(
-                                                    button, mouse.x, mouse.y,
-                                                );
-                                            } else {
-                                                event_handler.mouse_button_down_event(
-                                                    button, mouse.x, mouse.y,
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(errno) => {
-                                    eprintln!(
-                                        "Failed to read from {}: {}",
-                                        mouse.name,
-                                        strerror(errno).to_string_lossy()
-                                    );
                                 }
                             }
                         }
                     }
                 }
+                read_ticker.stop();
 
                 // TODO what's the point of this code?
                 let mut d = crate::native_display().try_lock().unwrap();
@@ -1207,10 +1395,18 @@ where
                     }
                 }
             }
+            event_handler_ticker.start();
             event_handler.update();
+            event_handler_ticker.stop();
+            event_handler_draw_ticker.start();
             event_handler.draw();
+            event_handler_draw_ticker.stop();
+            present_ticker.start();
             output_present();
+            present_ticker.stop();
+            flip_ticker.start();
             wait_for_flip();
+            flip_ticker.stop();
         }
 
         // Cleanup
@@ -1275,18 +1471,19 @@ pub fn key_from_event(event: &libc::input_event) -> Option<(KeyCode, KeyAction)>
 
 unsafe fn read_input_events<'a>(
     poll: &libc::pollfd,
-    event_buf: &'a mut [libc::input_event; 16],
+    event_buf: &'a mut [libc::input_event],
 ) -> Result<&'a [libc::input_event], i32> {
+    const EVENT_SIZE: usize = std::mem::size_of::<libc::input_event>();
     let read_status = libc::read(
         poll.fd,
         event_buf.as_mut_ptr() as *mut _,
-        std::mem::size_of_val(&*event_buf),
+        event_buf.len() * EVENT_SIZE,
     );
     if read_status < 0 {
         // eprintln!("Had fail on {}", kbd.name);
         Err(errno())
     } else {
-        Ok(&event_buf[..read_status as usize / std::mem::size_of_val(&event_buf[0])])
+        Ok(&event_buf[..read_status as usize / EVENT_SIZE])
     }
 }
 

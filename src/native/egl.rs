@@ -23,19 +23,25 @@ pub use core::ptr::null_mut;
 pub const EGL_SUCCESS: u32 = 12288;
 
 pub const EGL_WINDOW_BIT: u32 = 4;
+pub const EGL_OPENGL_BIT: u32 = 0x0008;
+pub const EGL_OPENGL_API: u32 = 0x30A2;
 
 pub const EGL_ALPHA_SIZE: u32 = 12321;
 pub const EGL_BLUE_SIZE: u32 = 12322;
 pub const EGL_GREEN_SIZE: u32 = 12323;
 pub const EGL_RED_SIZE: u32 = 12324;
 pub const EGL_DEPTH_SIZE: u32 = 12325;
+pub const EGL_SAMPLES: u32 = 0x3031;
 pub const EGL_STENCIL_SIZE: u32 = 12326;
 pub const EGL_NATIVE_VISUAL_ID: u32 = 12334;
 pub const EGL_WIDTH: u32 = 12375;
 pub const EGL_HEIGHT: u32 = 12374;
 pub const EGL_SURFACE_TYPE: u32 = 12339;
+pub const EGL_RENDERABLE_TYPE: u32 = 0x3040;
 pub const EGL_NONE: u32 = 12344;
 pub const EGL_CONTEXT_CLIENT_VERSION: u32 = 12440;
+pub const EGL_CONTEXT_FLAGS_KHR: u32 = 0x30FC;
+pub const EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR: u32 = 0x00000001;
 pub const EGL_PLATFORM_GBM_MESA: u32 = 0x31D7;
 pub const EGL_EXTENSIONS: u32 = 0x3055;
 pub const EGL_CLIENT_APIS: u32 = 0x308D;
@@ -234,6 +240,7 @@ pub struct LibEgl {
     pub eglSwapInterval: PFNEGLSWAPINTERVALPROC,
     pub eglGetPlatformDisplayEXT: PFNEGLGETPLATFORMDISPLAYEXTPROC,
     pub eglCreatePlatformWindowSurfaceEXT: PFNEGLCREATEPLATFORMWINDOWSURFACEEXTPROC,
+    pub eglBindAPI: Option<unsafe extern "C" fn(EGLenum) -> EGLBoolean>,
 }
 
 impl LibEgl {
@@ -271,6 +278,7 @@ impl LibEgl {
                     eglReleaseTexImage: module.get_symbol("eglReleaseTexImage").ok(),
                     eglSurfaceAttrib: module.get_symbol("eglSurfaceAttrib").ok(),
                     eglSwapInterval: module.get_symbol("eglSwapInterval").ok(),
+                    eglBindAPI: module.get_symbol("eglBindAPI").ok(),
                     eglGetPlatformDisplayEXT: eglGetProcAddress
                         .and_then(|f| unsafe { (f)("eglGetPlatformDisplayEXT\0".as_ptr() as _) })
                         .map(|p| unsafe { std::mem::transmute(p) }),
@@ -315,9 +323,13 @@ pub unsafe fn create_egl_context(
         return Err(EglError::InitializeFailed);
     }
 
+    // TODO make err
+    assert!(1 == (egl.eglBindAPI.unwrap())(EGL_OPENGL_API as i32));
+
     let alpha_size = if alpha { 8 } else { 0 };
     #[rustfmt::skip]
     let cfg_attributes = vec![
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
         EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
         EGL_RED_SIZE, 8,
         EGL_GREEN_SIZE, 8,
@@ -325,6 +337,7 @@ pub unsafe fn create_egl_context(
         EGL_ALPHA_SIZE, alpha_size,
         EGL_DEPTH_SIZE, 16,
         EGL_STENCIL_SIZE, 0,
+        // EGL_SAMPLES, 4,
         EGL_NONE,
     ];
     let mut available_cfgs: Vec<EGLConfig> = vec![null_mut(); 32];
@@ -343,36 +356,51 @@ pub unsafe fn create_egl_context(
     // find config with 8-bit rgb buffer if available, ndk sample does not trust egl spec
     let mut config: EGLConfig = null_mut();
     let mut exact_cfg_found = false;
+    pub const GBM_FORMAT_XRGB8888: u32 =
+        ((b'X' as u32) | ((b'R' as u32) << 8) | ((b'2' as u32) << 16) | ((b'4' as u32) << 24));
     for c in &mut available_cfgs[0..cfg_count] {
         let mut r: i32 = 0;
         let mut g: i32 = 0;
         let mut b: i32 = 0;
         let mut a: i32 = 0;
         let mut d: i32 = 0;
+        let mut format: i32 = 0;
         if (egl.eglGetConfigAttrib.unwrap())(display, *c, EGL_RED_SIZE as _, &mut r) == 1
             && (egl.eglGetConfigAttrib.unwrap())(display, *c, EGL_GREEN_SIZE as _, &mut g) == 1
             && (egl.eglGetConfigAttrib.unwrap())(display, *c, EGL_BLUE_SIZE as _, &mut b) == 1
             && (egl.eglGetConfigAttrib.unwrap())(display, *c, EGL_ALPHA_SIZE as _, &mut a) == 1
             && (egl.eglGetConfigAttrib.unwrap())(display, *c, EGL_DEPTH_SIZE as _, &mut d) == 1
+            && (egl.eglGetConfigAttrib.unwrap())(
+                display,
+                *c,
+                EGL_NATIVE_VISUAL_ID as _,
+                &mut format,
+            ) == 1
             && r == 8
             && g == 8
             && b == 8
             && (alpha_size == 0 || a == alpha_size as _)
             && d == 16
+            && format as u32 == GBM_FORMAT_XRGB8888
         {
             exact_cfg_found = true;
             config = *c;
             break;
         }
     }
-    if !exact_cfg_found {
+    if !dbg!(exact_cfg_found) {
         config = available_cfgs[0];
     }
-    // use EGL_KHR_create_context if you want to debug context together with GL_KHR_debug
-    // EGL_CONTEXT_FLAGS_KHR, EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR,
-    // use EGL_KHR_create_context_no_error for "production" builds, may improve performance
-    // EGL_CONTEXT_OPENGL_NO_ERROR_KHR, EGL_TRUE,
-    let ctx_attributes = vec![EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE];
+    let ctx_attributes = vec![
+        EGL_CONTEXT_CLIENT_VERSION,
+        2,
+        // use EGL_KHR_create_context if you want to debug context together with GL_KHR_debug
+        // EGL_CONTEXT_FLAGS_KHR,
+        // EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR,
+        // use EGL_KHR_create_context_no_error for "production" builds, may improve performance
+        // EGL_CONTEXT_OPENGL_NO_ERROR_KHR, EGL_TRUE,
+        EGL_NONE,
+    ];
     let context = (egl.eglCreateContext.unwrap())(
         display,
         config,
