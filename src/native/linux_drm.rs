@@ -20,6 +20,11 @@ use super::module;
 
 use keyboard_layouts::{available_layouts, string_to_keys_and_modifiers};
 
+use std::os::raw::{c_int, c_ulong};
+extern "C" {
+    fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+}
+
 #[derive(Debug)]
 #[repr(C)]
 pub struct drmModeRes {
@@ -1487,27 +1492,31 @@ unsafe fn read_input_events<'a>(
     }
 }
 
-const EVIOCGRAB: u64 = 0x40044590;
-const EVIOCGREP: u64 = 0x80084503;
-const EVIOCSREP: u64 = 0x40084503;
-pub const fn EVIOCGABS(abs: AbsAxis) -> u64 {
-    0x80184540 + abs as u64
+pub type IoctlReq = c_ulong;
+
+const EVIOCGRAB: IoctlReq = 0x40044590;
+const EVIOCGREP: IoctlReq = 0x80084503;
+const EVIOCSREP: IoctlReq = 0x40084503;
+// Get device name with 256 length buffer.
+const EVIOCGNAME_256: IoctlReq = 0x81004506;
+pub const fn EVIOCGABS(abs: AbsAxis) -> IoctlReq {
+    0x80184540 + abs as IoctlReq
 }
-pub const fn EVIOCGBIT(ty: Option<EventType>, len: u64) -> u64 {
+pub const fn EVIOCGBIT(ty: Option<EventType>, len: IoctlReq) -> IoctlReq {
     let ty = match ty {
         None => 0,
-        Some(x) => x as u64,
+        Some(x) => x as IoctlReq,
     };
     (((2) << (((0 + 8) + 8) + 14))
-        | ((b'E' as u64) << (0 + 8))
+        | ((b'E' as IoctlReq) << (0 + 8))
         | ((0x20 + (ty)) << 0)
         | ((len) << ((0 + 8) + 8)))
 }
-pub const fn EVIOCGPROP(prop: InputProperty) -> u64 {
+pub const fn EVIOCGPROP(prop: InputProperty) -> IoctlReq {
     (((2) << (((0 + 8) + 8) + 14))
-        | ((b'E' as u64) << (0 + 8))
+        | ((b'E' as IoctlReq) << (0 + 8))
         | ((0x09) << 0)
-        | ((prop as u64) << ((0 + 8) + 8)))
+        | ((prop as IoctlReq) << ((0 + 8) + 8)))
 }
 #[derive(PartialEq, Eq, PartialOrd, Ord, Copy, Clone, Debug)]
 #[repr(u64)]
@@ -1608,11 +1617,9 @@ unsafe fn find_devices() -> (Vec<Keyboard>, Vec<Mouse>) {
             continue;
         }
         let mut kbd_repeat = KeyboardRepeat::default();
-        // Get device name with 256 length buffer.
-        const EVIOCGNAME_256: u64 = 0x81004506;
         let mut name_buffer = [0u8; 256];
         let mut name = None;
-        if 0 <= libc::ioctl(fd, EVIOCGNAME_256, name_buffer.as_ptr()) {
+        if 0 <= ioctl(fd, EVIOCGNAME_256, name_buffer.as_ptr()) {
             name = Some(
                 CStr::from_bytes_until_nul(&name_buffer)
                     .unwrap()
@@ -1627,15 +1634,15 @@ unsafe fn find_devices() -> (Vec<Keyboard>, Vec<Mouse>) {
         let mut x_abs_info = InputAbsinfo::default();
         let mut y_abs_info = InputAbsinfo::default();
         let mut event_types = 0u64;
-        if 0 <= libc::ioctl(
+        if 0 <= ioctl(
             fd,
-            EVIOCGBIT(None, std::mem::size_of_val(&event_types) as u64),
+            EVIOCGBIT(None, std::mem::size_of_val(&event_types) as IoctlReq),
             (&mut event_types) as *mut _,
         ) {
             // TODO check properties for how to translate screen size.
             if ((event_types >> (EventType::EV_REL as u32)) & 1) == 1 {
                 eprintln!("{} X: {x_abs_info:?}. Y: {y_abs_info:?}", path.display());
-                assert!(0 <= libc::ioctl(fd, EVIOCGRAB, 1));
+                assert!(0 <= ioctl(fd, EVIOCGRAB, 1));
                 mice.push(Mouse {
                     path,
                     name: name.unwrap_or_default(),
@@ -1645,12 +1652,12 @@ unsafe fn find_devices() -> (Vec<Keyboard>, Vec<Mouse>) {
                     x: 0.0,
                     y: 0.0,
                 });
-            } else if 0 <= libc::ioctl(fd, EVIOCGREP, &mut kbd_repeat) {
+            } else if 0 <= ioctl(fd, EVIOCGREP, &mut kbd_repeat) {
                 eprintln!("{} {kbd_repeat:?}", path.display());
                 // Get exclusive access to the keyboard.
                 // https://stackoverflow.com/questions/1698423/how-can-you-take-ownership-of-a-hid-device/1698686#1698686
                 // https://unix.stackexchange.com/questions/77756/can-i-stop-linux-from-listening-to-a-usb-input-device-as-a-keyboard-but-still-c
-                assert!(0 <= libc::ioctl(fd, EVIOCGRAB, 1));
+                assert!(0 <= ioctl(fd, EVIOCGRAB, 1));
                 keyboards.push(Keyboard {
                     name: name.unwrap_or_default(),
                     path,
@@ -1658,11 +1665,11 @@ unsafe fn find_devices() -> (Vec<Keyboard>, Vec<Mouse>) {
                     fd,
                     key_mods: KeyMods::default(),
                 });
-            } else if 0 <= libc::ioctl(fd, EVIOCGABS(AbsAxis::ABS_X), &mut x_abs_info)
-                && 0 <= libc::ioctl(fd, EVIOCGABS(AbsAxis::ABS_Y), &mut y_abs_info)
+            } else if 0 <= ioctl(fd, EVIOCGABS(AbsAxis::ABS_X), &mut x_abs_info)
+                && 0 <= ioctl(fd, EVIOCGABS(AbsAxis::ABS_Y), &mut y_abs_info)
             {
                 eprintln!("{} X: {x_abs_info:?}. Y: {y_abs_info:?}", path.display());
-                assert!(0 <= libc::ioctl(fd, EVIOCGRAB, 1));
+                assert!(0 <= ioctl(fd, EVIOCGRAB, 1));
                 mice.push(Mouse {
                     path,
                     name: name.unwrap_or_default(),
